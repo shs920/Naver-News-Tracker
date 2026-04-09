@@ -4,10 +4,7 @@ services:
     runtime: python
     plan: free
     rootDir: crawler
-    buildCommand: |
-      pip install -r requirements.txt
-      playwright install chromium
-      playwright install-deps chromium
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: SUPABASE_URL
