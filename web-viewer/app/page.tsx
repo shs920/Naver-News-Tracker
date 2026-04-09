@@ -1,27 +1,13 @@
-/**
- * 네이버 뉴스 추적기 — 웹 뷰어
- * Next.js App Router 단일 페이지 (app/page.tsx)
- *
- * 기능:
- *  - 수정된 기사 목록 표시
- *  - 버전 선택 후 제목·본문 diff 하이라이트
- *  - 이전·이후 이미지 나란히 비교
- *
- * 배포: Vercel에 GitHub 연동 후 자동 배포
- */
-
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-// ── Supabase 클라이언트 (anon key — 읽기 전용) ──────────────
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// ── 타입 ──────────────────────────────────────────────────
 interface Article {
   id: string;
   url: string;
@@ -40,175 +26,208 @@ interface Version {
   fetched_at: string;
 }
 
-// ── diff 유틸: 변경된 문장을 하이라이트 ──────────────────────
-function diffText(oldText: string, newText: string): React.ReactNode {
-  const oldLines = (oldText || "").split("\n");
-  const newLines = (newText || "").split("\n");
-  const result: React.ReactNode[] = [];
-
-  const maxLen = Math.max(oldLines.length, newLines.length);
-  for (let i = 0; i < maxLen; i++) {
-    const o = oldLines[i] ?? "";
-    const n = newLines[i] ?? "";
-    if (o === n) {
-      result.push(<p key={i} style={{ margin: "2px 0" }}>{n || "\u00A0"}</p>);
-    } else if (!o && n) {
-      result.push(
-        <p key={i} style={{ background: "#d4edda", margin: "2px 0", padding: "1px 4px", borderRadius: 3 }}>
-          + {n}
-        </p>
-      );
-    } else if (o && !n) {
-      result.push(
-        <p key={i} style={{ background: "#f8d7da", margin: "2px 0", padding: "1px 4px", borderRadius: 3, textDecoration: "line-through" }}>
-          - {o}
-        </p>
-      );
-    } else {
-      result.push(
-        <div key={i}>
-          <p style={{ background: "#f8d7da", margin: "2px 0", padding: "1px 4px", borderRadius: 3, textDecoration: "line-through" }}>- {o}</p>
-          <p style={{ background: "#d4edda", margin: "2px 0", padding: "1px 4px", borderRadius: 3 }}>+ {n}</p>
-        </div>
-      );
-    }
+function extractImageFilename(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.pathname.split("/").pop() || url;
+  } catch {
+    return url;
   }
-  return <div style={{ fontFamily: "monospace", fontSize: 13, lineHeight: 1.6 }}>{result}</div>;
 }
 
-// ── 메인 컴포넌트 ────────────────────────────────────────────
+function compareImages(oldImgs: string[], newImgs: string[]) {
+  const old_ = oldImgs || [];
+  const new_ = newImgs || [];
+  const result: {
+    type: "same" | "uncertain" | "removed" | "added";
+    oldUrl?: string;
+    newUrl?: string;
+  }[] = [];
+  const usedNew = new Set<number>();
+
+  old_.forEach((oldUrl) => {
+    const oldFile = extractImageFilename(oldUrl);
+    const exactIdx = new_.findIndex((u, i) => !usedNew.has(i) && u === oldUrl);
+    if (exactIdx !== -1) {
+      usedNew.add(exactIdx);
+      result.push({ type: "same", oldUrl, newUrl: new_[exactIdx] });
+      return;
+    }
+    const nameIdx = new_.findIndex(
+      (u, i) => !usedNew.has(i) && extractImageFilename(u) === oldFile
+    );
+    if (nameIdx !== -1) {
+      usedNew.add(nameIdx);
+      result.push({ type: "uncertain", oldUrl, newUrl: new_[nameIdx] });
+      return;
+    }
+    result.push({ type: "removed", oldUrl });
+  });
+
+  new_.forEach((newUrl, i) => {
+    if (!usedNew.has(i)) result.push({ type: "added", newUrl });
+  });
+
+  return { result, changed: result.some((r) => r.type !== "same") };
+}
+
+function splitSentences(text: string): string[] {
+  return (text || "").split(/(?<=[.!?。])\s+|\n+/).filter((s) => s.trim().length > 0);
+}
+
+type DiffItem = { type: "same"|"del"|"add"|"change"; old?: string; new?: string };
+
+function diffSentences(oldText: string, newText: string): DiffItem[] {
+  const oldS = splitSentences(oldText);
+  const newS = splitSentences(newText);
+  const m = oldS.length, n = newS.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = oldS[i-1] === newS[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
+
+  const raw: DiffItem[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldS[i-1] === newS[j-1]) {
+      raw.unshift({ type: "same", old: oldS[i-1], new: newS[j-1] }); i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+      raw.unshift({ type: "add", new: newS[j-1] }); j--;
+    } else {
+      raw.unshift({ type: "del", old: oldS[i-1] }); i--;
+    }
+  }
+
+  const merged: DiffItem[] = [];
+  for (let k = 0; k < raw.length; k++) {
+    if (raw[k].type === "del" && raw[k+1]?.type === "add") {
+      merged.push({ type: "change", old: raw[k].old, new: raw[k+1].new }); k++;
+    } else {
+      merged.push(raw[k]);
+    }
+  }
+  return merged;
+}
+
+function BodyDiff({ oldText, newText, vA, vB }: { oldText: string; newText: string; vA: number; vB: number }) {
+  const diff = diffSentences(oldText, newText);
+  const hl: React.CSSProperties = { background: "#ffd6d6", borderRadius: 4, padding: "2px 6px", color: "#7a0000", fontSize: 13, lineHeight: 1.7, margin: "3px 0" };
+  const nm: React.CSSProperties = { fontSize: 13, lineHeight: 1.7, margin: "3px 0", color: "var(--color-text-primary)" };
+  const em: React.CSSProperties = { margin: "3px 0", minHeight: 22 };
+
+  return (
+    <>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 10 }}>
+        <div style={{ fontSize: 11, fontWeight: 500, color: "#c0392b" }}>수정 전 (v{vA})</div>
+        <div style={{ fontSize: 11, fontWeight: 500, color: "#c0392b" }}>수정 후 (v{vB})</div>
+      </div>
+      {diff.map((d, idx) => (
+        <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 2 }}>
+          <div>
+            {d.type === "same"   && <p style={nm}>{d.old}</p>}
+            {d.type === "del"    && <p style={hl}>{d.old}</p>}
+            {d.type === "add"    && <p style={em} />}
+            {d.type === "change" && <p style={hl}>{d.old}</p>}
+          </div>
+          <div>
+            {d.type === "same"   && <p style={nm}>{d.new}</p>}
+            {d.type === "del"    && <p style={em} />}
+            {d.type === "add"    && <p style={hl}>{d.new}</p>}
+            {d.type === "change" && <p style={hl}>{d.new}</p>}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 export default function NewsTracker() {
   const [articles, setArticles] = useState<Article[]>([]);
-  const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
+  const [selected, setSelected] = useState<Article | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
-  const [vA, setVersionA] = useState<number>(0);
-  const [vB, setVersionB] = useState<number>(0);
+  const [vA, setVersionA] = useState(0);
+  const [vB, setVersionB] = useState(0);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
 
-  // 수정된 기사 목록 불러오기
   const fetchArticles = useCallback(async () => {
-    const { data } = await supabase
-      .from("articles")
-      .select("*")
-      .gt("current_version", 1)          // 2버전 이상 = 최소 1회 수정
-      .order("updated_at", { ascending: false })
-      .limit(100);
+    const { data } = await supabase.from("articles").select("*")
+      .gt("current_version", 1).order("updated_at", { ascending: false }).limit(100);
     if (data) setArticles(data);
   }, []);
 
   useEffect(() => {
     fetchArticles();
-    const interval = setInterval(fetchArticles, 60_000); // 1분마다 갱신
-    return () => clearInterval(interval);
+    const t = setInterval(fetchArticles, 60000);
+    return () => clearInterval(t);
   }, [fetchArticles]);
 
-  // 기사 선택 → 버전 목록 불러오기
-  const selectArticle = async (article: Article) => {
-    setSelectedArticle(article);
-    setLoading(true);
-    const { data } = await supabase
-      .from("article_versions")
-      .select("*")
-      .eq("article_id", article.id)
-      .order("version", { ascending: true });
+  const selectArticle = async (a: Article) => {
+    setSelected(a); setLoading(true);
+    const { data } = await supabase.from("article_versions").select("*")
+      .eq("article_id", a.id).order("version", { ascending: true });
     if (data) {
       setVersions(data);
-      // 기본: 마지막 두 버전 비교
-      if (data.length >= 2) {
-        setVersionA(data[data.length - 2].version);
-        setVersionB(data[data.length - 1].version);
-      }
+      if (data.length >= 2) { setVersionA(data[data.length-2].version); setVersionB(data[data.length-1].version); }
     }
     setLoading(false);
   };
 
   const verA = versions.find((v) => v.version === vA);
   const verB = versions.find((v) => v.version === vB);
-  const filteredArticles = articles.filter(
-    (a) =>
-      a.title?.includes(search) ||
-      a.press?.includes(search) ||
-      a.url?.includes(search)
-  );
+  const filtered = articles.filter((a) => a.title?.includes(search) || a.press?.includes(search) || a.url?.includes(search));
+  const imgDiff = verA && verB ? compareImages(verA.images || [], verB.images || []) : null;
+  const titleChanged = verA && verB && verA.title !== verB.title;
+  const bodyChanged  = verA && verB && verA.body  !== verB.body;
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, sans-serif", fontSize: 14 }}>
 
-      {/* ── 왼쪽 패널: 기사 목록 ── */}
-      <div style={{ width: 340, borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column", background: "#f9f9f9" }}>
-        <div style={{ padding: "16px 12px 8px", borderBottom: "1px solid #e0e0e0" }}>
-          <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>📡 수정된 기사 목록</h2>
-          <input
-            placeholder="제목·언론사 검색"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={{ width: "100%", padding: "6px 8px", border: "1px solid #ccc", borderRadius: 6, fontSize: 13, boxSizing: "border-box" }}
-          />
+      {/* 왼쪽 목록 */}
+      <div style={{ width: 300, borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column", background: "#f9f9f9", flexShrink: 0 }}>
+        <div style={{ padding: "14px 12px 8px", borderBottom: "1px solid #e0e0e0" }}>
+          <h2 style={{ margin: "0 0 10px", fontSize: 15 }}>📡 수정된 기사 목록</h2>
+          <input placeholder="제목·언론사 검색" value={search} onChange={(e) => setSearch(e.target.value)}
+            style={{ width: "100%", padding: "6px 8px", border: "1px solid #ccc", borderRadius: 6, fontSize: 13, boxSizing: "border-box" }} />
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
-          {filteredArticles.length === 0 && (
-            <p style={{ color: "#999", textAlign: "center", marginTop: 40 }}>수정된 기사가 없습니다</p>
-          )}
-          {filteredArticles.map((a) => (
-            <div
-              key={a.id}
-              onClick={() => selectArticle(a)}
-              style={{
-                padding: "10px 12px",
-                borderBottom: "1px solid #eee",
-                cursor: "pointer",
-                background: selectedArticle?.id === a.id ? "#e8f0fe" : "transparent",
-                transition: "background 0.15s",
-              }}
-            >
-              <div style={{ fontWeight: 600, marginBottom: 3, lineHeight: 1.4 }}>{a.title || "제목 없음"}</div>
-              <div style={{ color: "#666", fontSize: 12 }}>
-                {a.press} · v{a.current_version}회 수정 · {new Date(a.updated_at).toLocaleString("ko-KR")}
-              </div>
+          {filtered.length === 0 && <p style={{ color: "#999", textAlign: "center", marginTop: 40 }}>수정된 기사가 없습니다</p>}
+          {filtered.map((a) => (
+            <div key={a.id} onClick={() => selectArticle(a)}
+              style={{ padding: "10px 12px", borderBottom: "1px solid #eee", cursor: "pointer", background: selected?.id === a.id ? "#e8f0fe" : "transparent" }}>
+              <div style={{ fontWeight: 600, marginBottom: 3, lineHeight: 1.4, fontSize: 13 }}>{a.title || "제목 없음"}</div>
+              <div style={{ color: "#666", fontSize: 11 }}>{a.press} · v{a.current_version}회 수정 · {new Date(a.updated_at).toLocaleString("ko-KR")}</div>
             </div>
           ))}
         </div>
       </div>
 
-      {/* ── 오른쪽 패널: 버전 비교 ── */}
+      {/* 오른쪽 비교 */}
       <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-        {!selectedArticle && (
+        {!selected && (
           <div style={{ textAlign: "center", color: "#999", marginTop: 100 }}>
             <div style={{ fontSize: 40 }}>📰</div>
             <p>왼쪽에서 기사를 선택하면 버전 비교가 표시됩니다</p>
           </div>
         )}
 
-        {selectedArticle && (
+        {selected && (
           <>
-            {/* 기사 정보 */}
-            <div style={{ marginBottom: 20 }}>
-              <h2 style={{ margin: "0 0 6px", fontSize: 18 }}>{selectedArticle.title}</h2>
-              <a href={selectedArticle.url} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", fontSize: 13 }}>
-                {selectedArticle.url}
-              </a>
+            <div style={{ marginBottom: 16 }}>
+              <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>{selected.title}</h2>
+              <a href={selected.url} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", fontSize: 12 }}>{selected.url}</a>
             </div>
 
-            {/* 버전 선택기 */}
-            <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 20, background: "#f0f4ff", padding: "10px 14px", borderRadius: 8 }}>
-              <label style={{ fontWeight: 600 }}>비교:</label>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 24, background: "#f0f4ff", padding: "10px 14px", borderRadius: 8 }}>
+              <span style={{ fontWeight: 600, fontSize: 13 }}>비교:</span>
               <select value={vA} onChange={(e) => setVersionA(Number(e.target.value))}
-                style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc" }}>
-                {versions.map((v) => (
-                  <option key={v.id} value={v.version}>
-                    v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}
-                  </option>
-                ))}
+                style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc", fontSize: 12 }}>
+                {versions.map((v) => <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>)}
               </select>
               <span>↔</span>
               <select value={vB} onChange={(e) => setVersionB(Number(e.target.value))}
-                style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc" }}>
-                {versions.map((v) => (
-                  <option key={v.id} value={v.version}>
-                    v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}
-                  </option>
-                ))}
+                style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc", fontSize: 12 }}>
+                {versions.map((v) => <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>)}
               </select>
             </div>
 
@@ -217,56 +236,78 @@ export default function NewsTracker() {
             {verA && verB && !loading && (
               <>
                 {/* 제목 비교 */}
-                {verA.title !== verB.title && (
-                  <section style={{ marginBottom: 24 }}>
-                    <h3 style={{ margin: "0 0 10px", fontSize: 15, color: "#333" }}>📌 제목 변경</h3>
+                {titleChanged && (
+                  <section style={{ marginBottom: 28 }}>
+                    <h3 style={{ margin: "0 0 10px", fontSize: 14, color: "#333" }}>📌 제목 변경</h3>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                       <div style={{ background: "#fff5f5", border: "1px solid #f5c6c6", borderRadius: 8, padding: 12 }}>
                         <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>수정 전 (v{vA})</div>
-                        <div>{verA.title}</div>
+                        <div style={{ background: "#ffd6d6", borderRadius: 4, padding: "4px 8px", color: "#7a0000", fontSize: 13, lineHeight: 1.6 }}>{verA.title}</div>
                       </div>
-                      <div style={{ background: "#f0fff4", border: "1px solid #b2dfdb", borderRadius: 8, padding: 12 }}>
-                        <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 600, marginBottom: 6 }}>수정 후 (v{vB})</div>
-                        <div>{verB.title}</div>
+                      <div style={{ background: "#fff5f5", border: "1px solid #f5c6c6", borderRadius: 8, padding: 12 }}>
+                        <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>수정 후 (v{vB})</div>
+                        <div style={{ background: "#ffd6d6", borderRadius: 4, padding: "4px 8px", color: "#7a0000", fontSize: 13, lineHeight: 1.6 }}>{verB.title}</div>
                       </div>
                     </div>
                   </section>
                 )}
 
-                {/* 본문 diff */}
-                <section style={{ marginBottom: 24 }}>
-                  <h3 style={{ margin: "0 0 10px", fontSize: 15, color: "#333" }}>📝 본문 비교</h3>
-                  <div style={{ background: "#fff", border: "1px solid #e0e0e0", borderRadius: 8, padding: 16, maxHeight: 500, overflowY: "auto" }}>
-                    {verA.body === verB.body
-                      ? <p style={{ color: "#999" }}>본문 변경 없음</p>
-                      : diffText(verA.body, verB.body)
-                    }
-                  </div>
+                {/* 본문 비교 */}
+                <section style={{ marginBottom: 28 }}>
+                  <h3 style={{ margin: "0 0 10px", fontSize: 14, color: "#333" }}>📝 본문 비교</h3>
+                  {!bodyChanged ? (
+                    <p style={{ color: "#999", fontSize: 13 }}>본문 변경 없음</p>
+                  ) : (
+                    <div style={{ maxHeight: 600, overflowY: "auto", border: "1px solid #e0e0e0", borderRadius: 8, padding: "14px 16px", background: "var(--color-background-primary)" }}>
+                      <BodyDiff oldText={verA.body} newText={verB.body} vA={vA} vB={vB} />
+                    </div>
+                  )}
                 </section>
 
-                {/* 사진 비교 */}
-                <section style={{ marginBottom: 24 }}>
-                  <h3 style={{ margin: "0 0 10px", fontSize: 15, color: "#333" }}>🖼️ 사진 비교</h3>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                    <div>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: "#c0392b", marginBottom: 8 }}>수정 전 (v{vA})</div>
-                      {(verA.images || []).length === 0
-                        ? <p style={{ color: "#999" }}>사진 없음</p>
-                        : (verA.images || []).map((img, i) => (
-                            <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, marginBottom: 8, border: "1px solid #ddd" }} />
-                          ))
-                      }
-                    </div>
-                    <div>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: "#27ae60", marginBottom: 8 }}>수정 후 (v{vB})</div>
-                      {(verB.images || []).length === 0
-                        ? <p style={{ color: "#999" }}>사진 없음</p>
-                        : (verB.images || []).map((img, i) => (
-                            <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, marginBottom: 8, border: "1px solid #ddd" }} />
-                          ))
-                      }
-                    </div>
-                  </div>
+                {/* 사진 비교 — 3단계 */}
+                <section style={{ marginBottom: 28 }}>
+                  <h3 style={{ margin: "0 0 10px", fontSize: 14, color: "#333" }}>🖼️ 사진 비교</h3>
+                  {!imgDiff?.changed ? (
+                    <p style={{ color: "#999", fontSize: 13 }}>사진 변경 없음</p>
+                  ) : (
+                    imgDiff.result.map((item, i) => {
+                      if (item.type === "same") return null;
+
+                      if (item.type === "uncertain") return (
+                        <div key={i} style={{ marginBottom: 20 }}>
+                          <div style={{ background: "#fff8e1", border: "1px solid #ffe082", borderRadius: 8, padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#7a5c00" }}>
+                            ⚠️ 파일명은 같지만 URL이 다릅니다 — 육안으로 직접 비교해 주세요
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                            <div>
+                              <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>이전 사진</div>
+                              <img src={item.oldUrl} alt="" style={{ width: "100%", borderRadius: 6, border: "1px solid #ddd" }} />
+                            </div>
+                            <div>
+                              <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>현재 사진</div>
+                              <img src={item.newUrl} alt="" style={{ width: "100%", borderRadius: 6, border: "1px solid #ddd" }} />
+                            </div>
+                          </div>
+                        </div>
+                      );
+
+                      if (item.type === "removed") return (
+                        <div key={i} style={{ marginBottom: 16 }}>
+                          <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>🗑️ 삭제된 사진</div>
+                          <img src={item.oldUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #f5c6c6" }} />
+                        </div>
+                      );
+
+                      if (item.type === "added") return (
+                        <div key={i} style={{ marginBottom: 16 }}>
+                          <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 600, marginBottom: 6 }}>➕ 추가된 사진</div>
+                          <img src={item.newUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #b2dfdb" }} />
+                        </div>
+                      );
+
+                      return null;
+                    })
+                  )}
                 </section>
               </>
             )}
