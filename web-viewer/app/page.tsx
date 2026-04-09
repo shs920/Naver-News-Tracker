@@ -15,6 +15,8 @@ interface Article {
   press: string;
   current_version: number;
   updated_at: string;
+  is_deleted: boolean;
+  deleted_at: string | null;
 }
 
 interface Version {
@@ -28,8 +30,7 @@ interface Version {
 
 function extractImageFilename(url: string): string {
   try {
-    const u = new URL(url);
-    return u.pathname.split("/").pop() || url;
+    return new URL(url).pathname.split("/").pop() || url;
   } catch {
     return url;
   }
@@ -75,7 +76,7 @@ function splitSentences(text: string): string[] {
   return (text || "").split(/(?<=[.!?。])\s+|\n+/).filter((s) => s.trim().length > 0);
 }
 
-type DiffItem = { type: "same"|"del"|"add"|"change"; old?: string; new?: string };
+type DiffItem = { type: "same" | "del" | "add" | "change"; old?: string; new?: string };
 
 function diffSentences(oldText: string, newText: string): DiffItem[] {
   const oldS = splitSentences(oldText);
@@ -141,6 +142,54 @@ function BodyDiff({ oldText, newText, vA, vB }: { oldText: string; newText: stri
   );
 }
 
+// ── 삭제된 기사 상세 뷰 ──────────────────────────────────
+function DeletedArticleView({ article, versions }: { article: Article; versions: Version[] }) {
+  const last = versions[versions.length - 1];
+  if (!last) return <p style={{ color: "#999" }}>저장된 내용이 없습니다</p>;
+
+  return (
+    <div>
+      <div style={{ background: "#fff3cd", border: "1px solid #ffc107", borderRadius: 8, padding: "12px 16px", marginBottom: 20 }}>
+        <div style={{ fontWeight: 600, color: "#7a4f00", marginBottom: 4 }}>🚨 삭제된 기사</div>
+        <div style={{ fontSize: 13, color: "#7a4f00" }}>
+          이 기사는 네이버에서 삭제됐습니다.
+          {article.deleted_at && (
+            <> 삭제 감지 시각: {new Date(article.deleted_at).toLocaleString("ko-KR")}</>
+          )}
+        </div>
+      </div>
+
+      <section style={{ marginBottom: 24 }}>
+        <h3 style={{ fontSize: 14, color: "#333", margin: "0 0 10px" }}>📌 삭제 전 마지막 제목 (v{last.version})</h3>
+        <div style={{ background: "#fff8e1", border: "1px solid #ffe082", borderRadius: 8, padding: "10px 14px", fontSize: 15, fontWeight: 500 }}>
+          {last.title}
+        </div>
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h3 style={{ fontSize: 14, color: "#333", margin: "0 0 10px" }}>📝 삭제 전 마지막 본문 (v{last.version})</h3>
+        <div style={{ background: "#fffde7", border: "1px solid #fff9c4", borderRadius: 8, padding: "14px 16px", fontSize: 13, lineHeight: 1.8, maxHeight: 500, overflowY: "auto" }}>
+          {(last.body || "").split("\n").map((line, i) => (
+            <p key={i} style={{ margin: "3px 0" }}>{line || "\u00A0"}</p>
+          ))}
+        </div>
+      </section>
+
+      {(last.images || []).length > 0 && (
+        <section style={{ marginBottom: 24 }}>
+          <h3 style={{ fontSize: 14, color: "#333", margin: "0 0 10px" }}>🖼️ 삭제 전 마지막 사진</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 12 }}>
+            {(last.images || []).map((img, i) => (
+              <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "1px solid #ddd" }} />
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// ── 메인 컴포넌트 ────────────────────────────────────────
 export default function NewsTracker() {
   const [articles, setArticles] = useState<Article[]>([]);
   const [selected, setSelected] = useState<Article | null>(null);
@@ -149,10 +198,13 @@ export default function NewsTracker() {
   const [vB, setVersionB] = useState(0);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<"modified" | "deleted">("modified");
 
   const fetchArticles = useCallback(async () => {
-    const { data } = await supabase.from("articles").select("*")
-      .gt("current_version", 1).order("updated_at", { ascending: false }).limit(100);
+    const { data } = await supabase
+      .from("articles").select("*")
+      .order("updated_at", { ascending: false })
+      .limit(200);
     if (data) setArticles(data);
   }, []);
 
@@ -168,14 +220,31 @@ export default function NewsTracker() {
       .eq("article_id", a.id).order("version", { ascending: true });
     if (data) {
       setVersions(data);
-      if (data.length >= 2) { setVersionA(data[data.length-2].version); setVersionB(data[data.length-1].version); }
+      if (data.length >= 2) {
+        setVersionA(data[data.length - 2].version);
+        setVersionB(data[data.length - 1].version);
+      } else if (data.length === 1) {
+        setVersionA(data[0].version);
+        setVersionB(data[0].version);
+      }
     }
     setLoading(false);
   };
 
   const verA = versions.find((v) => v.version === vA);
   const verB = versions.find((v) => v.version === vB);
-  const filtered = articles.filter((a) => a.title?.includes(search) || a.press?.includes(search) || a.url?.includes(search));
+
+  const modifiedList = articles.filter(
+    (a) => !a.is_deleted && a.current_version > 1 &&
+      (a.title?.includes(search) || a.press?.includes(search))
+  );
+  const deletedList = articles.filter(
+    (a) => a.is_deleted &&
+      (a.title?.includes(search) || a.press?.includes(search))
+  );
+
+  const activeList = tab === "modified" ? modifiedList : deletedList;
+
   const imgDiff = verA && verB ? compareImages(verA.images || [], verB.images || []) : null;
   const titleChanged = verA && verB && verA.title !== verB.title;
   const bodyChanged  = verA && verB && verA.body  !== verB.body;
@@ -186,17 +255,47 @@ export default function NewsTracker() {
       {/* 왼쪽 목록 */}
       <div style={{ width: 300, borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column", background: "#f9f9f9", flexShrink: 0 }}>
         <div style={{ padding: "14px 12px 8px", borderBottom: "1px solid #e0e0e0" }}>
-          <h2 style={{ margin: "0 0 10px", fontSize: 15 }}>📡 수정된 기사 목록</h2>
+          <h2 style={{ margin: "0 0 10px", fontSize: 15 }}>📡 네이버 뉴스 추적기</h2>
+
+          {/* 탭 */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+            <button onClick={() => { setTab("modified"); setSelected(null); }}
+              style={{ flex: 1, padding: "6px 0", borderRadius: 6, border: "1px solid #ccc", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                background: tab === "modified" ? "#1a73e8" : "#fff", color: tab === "modified" ? "#fff" : "#333" }}>
+              ✏️ 수정된 기사 ({modifiedList.length})
+            </button>
+            <button onClick={() => { setTab("deleted"); setSelected(null); }}
+              style={{ flex: 1, padding: "6px 0", borderRadius: 6, border: "1px solid #ccc", fontSize: 12, fontWeight: 600, cursor: "pointer",
+                background: tab === "deleted" ? "#e53935" : "#fff", color: tab === "deleted" ? "#fff" : "#333" }}>
+              🚨 삭제된 기사 ({deletedList.length})
+            </button>
+          </div>
+
           <input placeholder="제목·언론사 검색" value={search} onChange={(e) => setSearch(e.target.value)}
             style={{ width: "100%", padding: "6px 8px", border: "1px solid #ccc", borderRadius: 6, fontSize: 13, boxSizing: "border-box" }} />
         </div>
+
         <div style={{ flex: 1, overflowY: "auto" }}>
-          {filtered.length === 0 && <p style={{ color: "#999", textAlign: "center", marginTop: 40 }}>수정된 기사가 없습니다</p>}
-          {filtered.map((a) => (
+          {activeList.length === 0 && (
+            <p style={{ color: "#999", textAlign: "center", marginTop: 40, fontSize: 13 }}>
+              {tab === "modified" ? "수정된 기사가 없습니다" : "삭제된 기사가 없습니다"}
+            </p>
+          )}
+          {activeList.map((a) => (
             <div key={a.id} onClick={() => selectArticle(a)}
-              style={{ padding: "10px 12px", borderBottom: "1px solid #eee", cursor: "pointer", background: selected?.id === a.id ? "#e8f0fe" : "transparent" }}>
-              <div style={{ fontWeight: 600, marginBottom: 3, lineHeight: 1.4, fontSize: 13 }}>{a.title || "제목 없음"}</div>
-              <div style={{ color: "#666", fontSize: 11 }}>{a.press} · v{a.current_version}회 수정 · {new Date(a.updated_at).toLocaleString("ko-KR")}</div>
+              style={{ padding: "10px 12px", borderBottom: "1px solid #eee", cursor: "pointer",
+                background: selected?.id === a.id ? (a.is_deleted ? "#ffebee" : "#e8f0fe") : "transparent" }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 4, marginBottom: 3 }}>
+                {a.is_deleted && <span style={{ fontSize: 11, background: "#e53935", color: "#fff", borderRadius: 4, padding: "1px 5px", flexShrink: 0, marginTop: 1 }}>삭제</span>}
+                <div style={{ fontWeight: 600, lineHeight: 1.4, fontSize: 13 }}>{a.title || "제목 없음"}</div>
+              </div>
+              <div style={{ color: "#666", fontSize: 11 }}>
+                {a.press} ·{" "}
+                {a.is_deleted
+                  ? `삭제 감지: ${a.deleted_at ? new Date(a.deleted_at).toLocaleString("ko-KR") : "알 수 없음"}`
+                  : `v${a.current_version}회 수정 · ${new Date(a.updated_at).toLocaleString("ko-KR")}`
+                }
+              </div>
             </div>
           ))}
         </div>
@@ -206,12 +305,26 @@ export default function NewsTracker() {
       <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
         {!selected && (
           <div style={{ textAlign: "center", color: "#999", marginTop: 100 }}>
-            <div style={{ fontSize: 40 }}>📰</div>
-            <p>왼쪽에서 기사를 선택하면 버전 비교가 표시됩니다</p>
+            <div style={{ fontSize: 40 }}>{tab === "deleted" ? "🚨" : "📰"}</div>
+            <p>왼쪽에서 기사를 선택하면 내용이 표시됩니다</p>
           </div>
         )}
 
-        {selected && (
+        {selected && loading && <p style={{ color: "#999" }}>로딩 중...</p>}
+
+        {/* 삭제된 기사 뷰 */}
+        {selected && !loading && selected.is_deleted && (
+          <>
+            <div style={{ marginBottom: 16 }}>
+              <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>{selected.title}</h2>
+              <a href={selected.url} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", fontSize: 12 }}>{selected.url}</a>
+            </div>
+            <DeletedArticleView article={selected} versions={versions} />
+          </>
+        )}
+
+        {/* 수정된 기사 비교 뷰 */}
+        {selected && !loading && !selected.is_deleted && (
           <>
             <div style={{ marginBottom: 16 }}>
               <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>{selected.title}</h2>
@@ -231,9 +344,7 @@ export default function NewsTracker() {
               </select>
             </div>
 
-            {loading && <p style={{ color: "#999" }}>로딩 중...</p>}
-
-            {verA && verB && !loading && (
+            {verA && verB && (
               <>
                 {/* 제목 비교 */}
                 {titleChanged && (
@@ -264,7 +375,7 @@ export default function NewsTracker() {
                   )}
                 </section>
 
-                {/* 사진 비교 — 3단계 */}
+                {/* 사진 비교 */}
                 <section style={{ marginBottom: 28 }}>
                   <h3 style={{ margin: "0 0 10px", fontSize: 14, color: "#333" }}>🖼️ 사진 비교</h3>
                   {!imgDiff?.changed ? (
@@ -272,7 +383,6 @@ export default function NewsTracker() {
                   ) : (
                     imgDiff.result.map((item, i) => {
                       if (item.type === "same") return null;
-
                       if (item.type === "uncertain") return (
                         <div key={i} style={{ marginBottom: 20 }}>
                           <div style={{ background: "#fff8e1", border: "1px solid #ffe082", borderRadius: 8, padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#7a5c00" }}>
@@ -290,21 +400,18 @@ export default function NewsTracker() {
                           </div>
                         </div>
                       );
-
                       if (item.type === "removed") return (
                         <div key={i} style={{ marginBottom: 16 }}>
                           <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 600, marginBottom: 6 }}>🗑️ 삭제된 사진</div>
                           <img src={item.oldUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #f5c6c6" }} />
                         </div>
                       );
-
                       if (item.type === "added") return (
                         <div key={i} style={{ marginBottom: 16 }}>
                           <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 600, marginBottom: 6 }}>➕ 추가된 사진</div>
                           <img src={item.newUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #b2dfdb" }} />
                         </div>
                       );
-
                       return null;
                     })
                   )}
