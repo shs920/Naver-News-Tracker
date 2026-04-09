@@ -3,7 +3,7 @@ import hashlib
 import os
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from bs4 import BeautifulSoup
@@ -163,7 +163,7 @@ async def send_telegram(old: dict, new: dict, url: str, press: str, version: int
     msg = (
         f"🔴 기사 수정 감지 (v{version})\n\n"
         f"📰 {press}\n"
-        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🕐 {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')} (KST)\n"
         f"🔗 {url}\n\n"
         + ("\n\n".join(changes) if changes else "내용 변경 감지")
     )
