@@ -1,3 +1,11 @@
+"""
+네이버 뉴스 추적기 - 완성본
+- 2분마다 네이버 뉴스 수집
+- 기사 수정 감지 → 텔레그램 알림
+- 기사 삭제 감지 → 텔레그램 알림
+- Render 무료 웹서비스 호환 (aiohttp 헬스체크)
+"""
+
 import asyncio
 import hashlib
 import os
@@ -19,8 +27,14 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 CRAWL_INTERVAL_SEC = int(os.getenv("CRAWL_INTERVAL_SEC", "120"))
 
+KST = timezone(timedelta(hours=9))
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
@@ -41,14 +55,16 @@ NAVER_RSS_FEEDS = [
     "https://news.naver.com/main/rss/sports.nhn",
 ]
 
-ADDITIONAL_URLS = [
-    "https://n.news.naver.com/mnews/article/list?sid=100",
-    "https://n.news.naver.com/mnews/article/list?sid=101",
-    "https://n.news.naver.com/mnews/article/list?sid=102",
+DELETED_KEYWORDS = [
+    "삭제된 기사",
+    "존재하지 않는 기사",
+    "서비스하지 않는 기사",
+    "이 기사는 언론사가 삭제했습니다",
+    "요청하신 페이지를 찾을 수 없습니다",
 ]
 
 
-# ── Supabase REST API 직접 호출 ──────────────────────────
+# ── Supabase REST API ─────────────────────────────────────
 async def supa_get(table: str, params: dict) -> list:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     async with httpx.AsyncClient(headers=SUPA_HEADERS, timeout=10) as c:
@@ -71,7 +87,7 @@ async def supa_patch(table: str, match: dict, data: dict):
         await c.patch(url, params=params, json=data)
 
 
-# ── RSS 수집 ─────────────────────────────────────────────
+# ── RSS + 홈페이지에서 URL 수집 ───────────────────────────
 async def fetch_urls() -> list[str]:
     urls: set[str] = set()
     async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as c:
@@ -86,10 +102,8 @@ async def fetch_urls() -> list[str]:
             except Exception as ex:
                 log.warning(f"RSS 오류: {ex}")
 
-        # 네이버 뉴스 홈에서 직접 기사 링크 수집
         try:
             r = await c.get("https://news.naver.com/")
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(r.text, "lxml")
             for a in soup.select("a[href*='news.naver.com/article']"):
                 urls.add(a["href"])
@@ -150,33 +164,96 @@ async def parse_article(url: str) -> dict | None:
             return None
 
 
-# ── 텔레그램 알림 ─────────────────────────────────────────
-async def send_telegram(old: dict, new: dict, url: str, press: str, version: int):
+# ── 삭제 여부 확인 ────────────────────────────────────────
+async def check_deleted(url: str) -> bool:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=False) as c:
+        try:
+            r = await c.get(url)
+            if r.status_code == 404:
+                return True
+            if r.status_code in (301, 302, 303):
+                location = r.headers.get("location", "")
+                if ("news.naver.com/article" not in location and
+                        "n.news.naver.com/article" not in location):
+                    return True
+            if r.status_code == 200:
+                if any(kw in r.text for kw in DELETED_KEYWORDS):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+# ── 텔레그램: 기사 수정 알림 ─────────────────────────────
+async def send_telegram_modified(old: dict, new: dict, url: str, press: str, version: int):
     changes = []
     if old["title"] != new["title"]:
-        changes.append(f"📌 제목\n  이전: {old['title']}\n  이후: {new['title']}")
+        changes.append(f"📌 제목 변경\n  이전: {old['title']}\n  이후: {new['title']}")
     if old["body"] != new["body"]:
-        changes.append(f"📝 본문 변경됨")
+        changes.append("📝 본문 변경됨")
     if old.get("images") != new.get("images"):
-        changes.append(f"🖼️ 사진 변경됨")
+        changes.append("🖼️ 사진 변경됨")
 
     msg = (
-        f"🔴 기사 수정 감지 (v{version})\n\n"
+        f"🔴 기사 수정 감지! (v{version})\n\n"
         f"📰 {press}\n"
-        f"🕐 {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')} (KST)\n"
+        f"🕐 {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} (KST)\n"
         f"🔗 {url}\n\n"
-        + ("\n\n".join(changes) if changes else "내용 변경 감지")
+        + ("\n\n".join(changes) if changes else "내용 변경 감지") +
+        "\n\n👉 웹 뷰어에서 전체 비교 확인 가능"
     )
     async with httpx.AsyncClient(timeout=15) as c:
         await c.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
         )
-    log.info(f"텔레그램 발송: {url}")
+    log.info(f"텔레그램 수정 알림: {url}")
 
 
-# ── 기사 처리 ─────────────────────────────────────────────
+# ── 텔레그램: 기사 삭제 알림 ─────────────────────────────
+async def send_telegram_deleted(record: dict, url: str):
+    msg = (
+        f"🚨 기사 삭제 감지!\n\n"
+        f"📰 {record.get('press', '알 수 없음')}\n"
+        f"📌 {record.get('title', '제목 없음')}\n"
+        f"🕐 {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} (KST)\n"
+        f"🔗 {url}\n\n"
+        f"⚠️ 이 기사는 네이버에서 삭제되었습니다.\n"
+        f"👉 웹 뷰어에서 삭제 전 마지막 내용 확인 가능"
+    )
+    async with httpx.AsyncClient(timeout=15) as c:
+        await c.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+        )
+    log.info(f"텔레그램 삭제 알림: {url}")
+
+
+# ── 삭제된 기사 DB 처리 ───────────────────────────────────
+async def handle_deleted_article(url: str):
+    rows = await supa_get("articles", {"url": f"eq.{url}", "select": "*"})
+    if not rows:
+        return
+    record = rows[0]
+    if record.get("is_deleted"):
+        return
+    article_id = record["id"]
+    log.info(f"기사 삭제 처리: {record.get('title', url)[:40]}")
+    await supa_patch("articles", {"id": article_id}, {
+        "is_deleted": True,
+        "deleted_at": datetime.now(KST).isoformat(),
+    })
+    await send_telegram_deleted(record, url)
+
+
+# ── 기사 1개 처리 파이프라인 ─────────────────────────────
 async def process_article(url: str):
+    # 1. 삭제 여부 먼저 확인
+    if await check_deleted(url):
+        await handle_deleted_article(url)
+        return
+
+    # 2. 정상 기사 파싱
     parsed = await parse_article(url)
     if not parsed:
         return
@@ -190,6 +267,10 @@ async def process_article(url: str):
         return
 
     article_id = record["id"]
+
+    if record.get("is_deleted"):
+        return
+
     versions = await supa_get("article_versions", {
         "article_id": f"eq.{article_id}",
         "select": "*",
@@ -227,10 +308,10 @@ async def process_article(url: str):
     await supa_patch("articles", {"id": article_id}, {
         "current_version": new_v, "title": parsed["title"],
     })
-    await send_telegram(latest, parsed, url, parsed["press"], new_v)
+    await send_telegram_modified(latest, parsed, url, parsed["press"], new_v)
 
 
-# ── 헬스체크 서버 (Render 무료 필수) ─────────────────────
+# ── 헬스체크 서버 ─────────────────────────────────────────
 async def health_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="ok"))
@@ -250,9 +331,11 @@ async def main():
         try:
             urls = await fetch_urls()
             sem = asyncio.Semaphore(5)
+
             async def run(u):
                 async with sem:
                     await process_article(u)
+
             await asyncio.gather(*[run(u) for u in urls])
         except Exception as ex:
             log.error(f"루프 오류: {ex}")
