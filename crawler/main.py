@@ -41,6 +41,12 @@ NAVER_RSS_FEEDS = [
     "https://news.naver.com/main/rss/sports.nhn",
 ]
 
+ADDITIONAL_URLS = [
+    "https://n.news.naver.com/mnews/article/list?sid=100",
+    "https://n.news.naver.com/mnews/article/list?sid=101",
+    "https://n.news.naver.com/mnews/article/list?sid=102",
+]
+
 
 # ── Supabase REST API 직접 호출 ──────────────────────────
 async def supa_get(table: str, params: dict) -> list:
@@ -68,17 +74,30 @@ async def supa_patch(table: str, match: dict, data: dict):
 # ── RSS 수집 ─────────────────────────────────────────────
 async def fetch_urls() -> list[str]:
     urls: set[str] = set()
-    async with httpx.AsyncClient(headers=HEADERS, timeout=15) as c:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as c:
         for feed_url in NAVER_RSS_FEEDS:
             try:
                 r = await c.get(feed_url)
                 feed = feedparser.parse(r.text)
                 for e in feed.entries:
                     link = e.get("link", "")
-                    if "news.naver.com" in link:
+                    if "news.naver.com" in link or "n.news.naver.com" in link:
                         urls.add(link)
             except Exception as ex:
                 log.warning(f"RSS 오류: {ex}")
+
+        # 네이버 뉴스 홈에서 직접 기사 링크 수집
+        try:
+            r = await c.get("https://news.naver.com/")
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "lxml")
+            for a in soup.select("a[href*='news.naver.com/article']"):
+                urls.add(a["href"])
+            for a in soup.select("a[href*='n.news.naver.com/article']"):
+                urls.add(a["href"])
+        except Exception as ex:
+            log.warning(f"홈 수집 오류: {ex}")
+
     log.info(f"수집 URL: {len(urls)}개")
     return list(urls)
 
