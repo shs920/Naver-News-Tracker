@@ -25,39 +25,70 @@ interface Version {
   title: string;
   body: string;
   images: string[];
+  image_phash: string | null;
   fetched_at: string;
 }
 
-// ── 이미지 비교 ───────────────────────────────────────────
-function extractFilename(url: string): string {
-  try { return new URL(url).pathname.split("/").pop() || url; }
-  catch { return url; }
+// ── pHash 해밍 거리 계산 ──────────────────────────────────
+function hammingDistance(a: string, b: string): number {
+  try {
+    const na = BigInt(a), nb = BigInt(b);
+    return (na ^ nb).toString(2).split("").filter(c => c === "1").length;
+  } catch { return 999; }
 }
 
-function compareImages(oldImgs: string[], newImgs: string[]) {
+const PHASH_THRESHOLD = 10;
+
+// ── 이미지 비교 (pHash 우선) ──────────────────────────────
+function compareImages(
+  oldImgs: string[], newImgs: string[],
+  oldPhash: string | null, newPhash: string | null
+) {
   const old_ = oldImgs || [], new_ = newImgs || [];
-  const result: { type: "same"|"uncertain"|"removed"|"added"; oldUrl?: string; newUrl?: string }[] = [];
-  const used = new Set<number>();
-  old_.forEach((ou) => {
-    const of_ = extractFilename(ou);
-    const ei = new_.findIndex((u, i) => !used.has(i) && u === ou);
-    if (ei !== -1) { used.add(ei); result.push({ type: "same", oldUrl: ou, newUrl: new_[ei] }); return; }
-    const ni = new_.findIndex((u, i) => !used.has(i) && extractFilename(u) === of_);
-    if (ni !== -1) { used.add(ni); result.push({ type: "uncertain", oldUrl: ou, newUrl: new_[ni] }); return; }
-    result.push({ type: "removed", oldUrl: ou });
-  });
-  new_.forEach((nu, i) => { if (!used.has(i)) result.push({ type: "added", newUrl: nu }); });
-  return { result, changed: result.some(r => r.type !== "same") };
+
+  // 개수 다르면 변경
+  if (old_.length !== new_.length) {
+    const removed = old_.filter(u => !new_.includes(u));
+    const added   = new_.filter(u => !old_.includes(u));
+    return { changed: true, sameByPhash: false, removed, added, uncertain: [] };
+  }
+
+  if (old_.length === 0) {
+    return { changed: false, sameByPhash: true, removed: [], added: [], uncertain: [] };
+  }
+
+  // pHash로 비교
+  if (oldPhash && newPhash) {
+    const dist = hammingDistance(oldPhash, newPhash);
+    if (dist <= PHASH_THRESHOLD) {
+      // 같은 이미지 → 변경 없음
+      return { changed: false, sameByPhash: true, removed: [], added: [], uncertain: [] };
+    } else {
+      // 다른 이미지 → 변경
+      return {
+        changed: true, sameByPhash: false,
+        removed: old_, added: new_, uncertain: []
+      };
+    }
+  }
+
+  // pHash 없으면 URL 비교
+  const same = old_.every((u, i) => u === new_[i]);
+  if (same) return { changed: false, sameByPhash: false, removed: [], added: [], uncertain: [] };
+
+  return {
+    changed: true, sameByPhash: false,
+    removed: [], added: [],
+    uncertain: old_.map((ou, i) => ({ oldUrl: ou, newUrl: new_[i] })).filter((_, i) => old_[i] !== new_[i])
+  };
 }
 
-// ── 단어 단위 diff → 변경 단어 볼드+형광펜 ──────────────
-function inlineDiff(oldText: string, newText: string): { oldNodes: React.ReactNode; newNodes: React.ReactNode } {
+// ── 단어 단위 diff ────────────────────────────────────────
+function inlineDiff(oldText: string, newText: string) {
   const tokenize = (t: string) => (t || "").split(/(\s+)/);
-  const oldW = tokenize(oldText);
-  const newW = tokenize(newText);
+  const oldW = tokenize(oldText), newW = tokenize(newText);
   const m = oldW.length, n = newW.length;
-
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  const dp: number[][] = Array.from({ length: m+1 }, () => new Array(n+1).fill(0));
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
       dp[i][j] = oldW[i-1] === newW[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
@@ -76,13 +107,9 @@ function inlineDiff(oldText: string, newText: string): { oldNodes: React.ReactNo
   }
 
   const HL: React.CSSProperties = {
-    background: "#ffd6d6",
-    color: "#7a0000",
-    fontWeight: 700,
-    borderRadius: 2,
-    padding: "0 1px",
+    background: "#ffd6d6", color: "#7a0000",
+    fontWeight: 700, borderRadius: 2, padding: "0 1px",
   };
-
   const oldNodes = ops.map((op, idx) =>
     op.type === "same" ? <span key={idx}>{op.text}</span>
     : op.type === "del" ? <mark key={idx} style={HL}>{op.text}</mark>
@@ -133,63 +160,31 @@ function BodyDiff({ oldText, newText, vA, vB }: {
   oldText: string; newText: string; vA: number; vB: number;
 }) {
   const diff = paragraphDiff(oldText, newText);
-
-  const normalStyle: React.CSSProperties = {
-    fontSize: 13, lineHeight: 1.8, margin: "0 0 8px",
-    color: "var(--color-text-primary)",
-  };
-  const changedStyle: React.CSSProperties = {
-    fontSize: 13, lineHeight: 1.8, margin: "0 0 8px",
-    background: "#fff0f0", borderRadius: 4, padding: "3px 7px",
-    borderLeft: "3px solid #e53935",
-  };
-  const deletedStyle: React.CSSProperties = {
-    ...changedStyle,
-    background: "#ffd6d6",
-  };
-  const emptyStyle: React.CSSProperties = { margin: "0 0 8px", minHeight: 24 };
+  const N: React.CSSProperties = { fontSize: 13, lineHeight: 1.8, margin: "0 0 8px", color: "var(--color-text-primary)" };
+  const C: React.CSSProperties = { fontSize: 13, lineHeight: 1.8, margin: "0 0 8px", background: "#fff0f0", borderRadius: 4, padding: "3px 7px", borderLeft: "3px solid #e53935" };
+  const D: React.CSSProperties = { ...C, background: "#ffd6d6" };
+  const E: React.CSSProperties = { margin: "0 0 8px", minHeight: 24 };
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-      {/* 왼쪽: 수정 전 전문 */}
       <div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>
-          수정 전 (v{vA})
-        </div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>수정 전 (v{vA})</div>
         {diff.map((d, idx) => {
-          if (d.type === "same") {
-            return <p key={idx} style={normalStyle}>{d.old}</p>;
-          }
-          if (d.type === "del") {
-            return <p key={idx} style={deletedStyle}><strong style={{ color: "#7a0000" }}>{d.old}</strong></p>;
-          }
-          if (d.type === "add") {
-            return <div key={idx} style={emptyStyle} />;
-          }
-          // change: 단어 단위 볼드+형광펜
+          if (d.type === "same") return <p key={idx} style={N}>{d.old}</p>;
+          if (d.type === "del")  return <p key={idx} style={D}><strong style={{ color: "#7a0000" }}>{d.old}</strong></p>;
+          if (d.type === "add")  return <div key={idx} style={E} />;
           const { oldNodes } = inlineDiff(d.old!, d.new!);
-          return <p key={idx} style={changedStyle}>{oldNodes}</p>;
+          return <p key={idx} style={C}>{oldNodes}</p>;
         })}
       </div>
-
-      {/* 오른쪽: 수정 후 전문 */}
       <div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>
-          수정 후 (v{vB})
-        </div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>수정 후 (v{vB})</div>
         {diff.map((d, idx) => {
-          if (d.type === "same") {
-            return <p key={idx} style={normalStyle}>{d.new}</p>;
-          }
-          if (d.type === "del") {
-            return <div key={idx} style={emptyStyle} />;
-          }
-          if (d.type === "add") {
-            return <p key={idx} style={deletedStyle}><strong style={{ color: "#7a0000" }}>{d.new}</strong></p>;
-          }
-          // change: 단어 단위 볼드+형광펜
+          if (d.type === "same") return <p key={idx} style={N}>{d.new}</p>;
+          if (d.type === "del")  return <div key={idx} style={E} />;
+          if (d.type === "add")  return <p key={idx} style={D}><strong style={{ color: "#7a0000" }}>{d.new}</strong></p>;
           const { newNodes } = inlineDiff(d.old!, d.new!);
-          return <p key={idx} style={changedStyle}>{newNodes}</p>;
+          return <p key={idx} style={C}>{newNodes}</p>;
         })}
       </div>
     </div>
@@ -289,6 +284,7 @@ export default function NewsTracker() {
   const verA = versions.find(v => v.version === vA);
   const verB = versions.find(v => v.version === vB);
 
+  // 실제로 의미 있는 변경이 있는 기사만 표시
   const modifiedList = articles.filter(a =>
     !a.is_deleted && a.current_version > 1 &&
     (a.title?.includes(search) || a.press?.includes(search))
@@ -297,7 +293,10 @@ export default function NewsTracker() {
     a.is_deleted && (a.title?.includes(search) || a.press?.includes(search))
   );
   const activeList = tab === "modified" ? modifiedList : deletedList;
-  const imgDiff = verA && verB ? compareImages(verA.images || [], verB.images || []) : null;
+
+  const imgDiff = verA && verB
+    ? compareImages(verA.images || [], verB.images || [], verA.image_phash || null, verB.image_phash || null)
+    : null;
   const titleChanged = verA && verB && verA.title !== verB.title;
   const bodyChanged  = verA && verB && verA.body  !== verB.body;
 
@@ -375,7 +374,6 @@ export default function NewsTracker() {
               <a href={selected.url} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", fontSize: 12 }}>{selected.url}</a>
             </div>
 
-            {/* 버전 선택 */}
             <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 24, background: "#f0f4ff", padding: "10px 14px", borderRadius: 8 }}>
               <span style={{ fontWeight: 700, fontSize: 13 }}>비교:</span>
               <select value={vA} onChange={e => setVersionA(Number(e.target.value))}
@@ -391,7 +389,7 @@ export default function NewsTracker() {
 
             {verA && verB && (
               <>
-                {/* 제목 비교 */}
+                {/* 제목 */}
                 {titleChanged && (
                   <section style={{ marginBottom: 28 }}>
                     <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>📌 제목 변경</h3>
@@ -399,7 +397,7 @@ export default function NewsTracker() {
                   </section>
                 )}
 
-                {/* 본문 비교 — 좌우 전문 + 볼드 형광펜 */}
+                {/* 본문 */}
                 <section style={{ marginBottom: 28 }}>
                   <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>📝 본문 비교</h3>
                   {!bodyChanged ? (
@@ -411,18 +409,17 @@ export default function NewsTracker() {
                   )}
                 </section>
 
-                {/* 사진 비교 */}
+                {/* 사진 */}
                 <section style={{ marginBottom: 28 }}>
                   <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>🖼️ 사진 비교</h3>
                   {!imgDiff?.changed ? (
                     <p style={{ color: "#999", fontSize: 13 }}>사진 변경 없음</p>
                   ) : (
-                    imgDiff.result.map((item, i) => {
-                      if (item.type === "same") return null;
-                      if (item.type === "uncertain") return (
+                    <>
+                      {imgDiff.uncertain.map((item, i) => (
                         <div key={i} style={{ marginBottom: 20 }}>
                           <div style={{ background: "#fff8e1", border: "1px solid #ffe082", borderRadius: 8, padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#7a5c00" }}>
-                            ⚠️ 파일명은 같지만 URL이 다릅니다 — 육안으로 직접 비교해 주세요
+                            ⚠️ URL이 다릅니다 — 육안으로 직접 비교해 주세요
                           </div>
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                             <div>
@@ -435,21 +432,20 @@ export default function NewsTracker() {
                             </div>
                           </div>
                         </div>
-                      );
-                      if (item.type === "removed") return (
-                        <div key={i} style={{ marginBottom: 16 }}>
-                          <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 700, marginBottom: 6 }}>🗑️ 삭제된 사진</div>
-                          <img src={item.oldUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #f5c6c6" }} />
+                      ))}
+                      {imgDiff.removed.length > 0 && imgDiff.added.length > 0 && (
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                          <div>
+                            <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 700, marginBottom: 8 }}>수정 전 사진</div>
+                            {imgDiff.removed.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #f5c6c6", marginBottom: 8 }} />)}
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 700, marginBottom: 8 }}>수정 후 사진</div>
+                            {imgDiff.added.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #b2dfdb", marginBottom: 8 }} />)}
+                          </div>
                         </div>
-                      );
-                      if (item.type === "added") return (
-                        <div key={i} style={{ marginBottom: 16 }}>
-                          <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 700, marginBottom: 6 }}>➕ 추가된 사진</div>
-                          <img src={item.newUrl} alt="" style={{ width: "50%", borderRadius: 6, border: "2px solid #b2dfdb" }} />
-                        </div>
-                      );
-                      return null;
-                    })
+                      )}
+                    </>
                   )}
                 </section>
               </>
