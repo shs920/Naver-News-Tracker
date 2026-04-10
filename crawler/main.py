@@ -1,9 +1,9 @@
 """
-네이버 뉴스 추적기 - 완성본
-- pHash로 이미지 내용 자체 비교 (URL 변경 오탐 차단)
-- 오탈자 수준 변경 알림 생략
+네이버 뉴스 추적기 - 완성본 v5
+- pHash를 DB에 저장 → 웹 뷰어에서도 정확한 사진 비교
+- 변경 없음 기사는 DB에 저장하지 않음
+- 오탈자/띄어쓰기 수준 변경은 저장도 알림도 안 함
 - 기사 삭제 감지
-- Render 무료 호환
 """
 
 import asyncio
@@ -65,11 +65,12 @@ DELETED_KEYWORDS = [
     "요청하신 페이지를 찾을 수 없습니다",
 ]
 
-TYPO_THRESHOLD = 0.05   # 변경 단어 비율 5% 미만 → 오탈자
-PHASH_THRESHOLD = 10    # 해밍 거리 10 이하 → 같은 이미지
+# 변경 단어 비율 8% 미만 → 오탈자로 판단 (저장도 알림도 안 함)
+TYPO_THRESHOLD = 0.08
+PHASH_THRESHOLD = 10  # 해밍 거리 10 이하 → 같은 이미지
 
 
-# ── pHash ────────────────────────────────────────────────
+# ── pHash ─────────────────────────────────────────────────
 def compute_phash(img_bytes: bytes) -> int | None:
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("L").resize((8, 8), Image.LANCZOS)
@@ -96,10 +97,23 @@ async def fetch_phash(url: str) -> int | None:
     return None
 
 
-async def images_really_changed(old_urls: list, new_urls: list) -> bool:
+async def get_image_phash_str(images: list) -> str:
+    """대표 이미지의 pHash를 문자열로 반환 (DB 저장용)"""
+    if not images:
+        return ""
+    h = await fetch_phash(images[0])
+    return str(h) if h is not None else ""
+
+
+async def images_really_changed(
+    old_urls: list, new_urls: list,
+    old_phash_str: str, new_phash_str: str
+) -> bool:
+    """pHash 비교로 실제 이미지 변경 여부 판단"""
     old_ = old_urls or []
     new_ = new_urls or []
 
+    # 개수가 달라지면 변경
     if len(old_) != len(new_):
         log.info(f"이미지 개수 변경: {len(old_)} → {len(new_)}")
         return True
@@ -107,20 +121,28 @@ async def images_really_changed(old_urls: list, new_urls: list) -> bool:
     if not old_:
         return False
 
-    # 대표 이미지(첫 번째)만 pHash 비교
+    # DB에 저장된 pHash 비교 (가장 빠름)
+    if old_phash_str and new_phash_str:
+        try:
+            dist = hamming(int(old_phash_str), int(new_phash_str))
+            log.info(f"pHash 해밍 거리: {dist} → {'변경' if dist > PHASH_THRESHOLD else '동일'}")
+            return dist > PHASH_THRESHOLD
+        except Exception:
+            pass
+
+    # pHash 없으면 실시간 다운로드 비교
     old_h = await fetch_phash(old_[0])
     new_h = await fetch_phash(new_[0])
+    if old_h is not None and new_h is not None:
+        dist = hamming(old_h, new_h)
+        log.info(f"pHash 실시간 해밍 거리: {dist} → {'변경' if dist > PHASH_THRESHOLD else '동일'}")
+        return dist > PHASH_THRESHOLD
 
-    if old_h is None or new_h is None:
-        log.info("pHash 계산 실패 → URL 비교로 대체")
-        return old_[0] != new_[0]
-
-    dist = hamming(old_h, new_h)
-    log.info(f"pHash 해밍 거리: {dist} (임계값: {PHASH_THRESHOLD}) → {'변경' if dist > PHASH_THRESHOLD else '동일'}")
-    return dist > PHASH_THRESHOLD
+    # 최후 수단: URL 비교
+    return old_[0] != new_[0]
 
 
-# ── Supabase ─────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────
 async def supa_get(table: str, params: dict) -> list:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     async with httpx.AsyncClient(headers=SUPA_HEADERS, timeout=10) as c:
@@ -207,7 +229,7 @@ async def parse_article(url: str) -> dict | None:
             if not title and not body:
                 return None
 
-            # 이미지 URL은 해시에서 제외 → pHash로만 비교
+            # 이미지 URL은 해시에서 제외
             h = hashlib.sha256((title + body).encode()).hexdigest()
             return {
                 "url": url, "title": title, "body": body,
@@ -221,13 +243,18 @@ async def parse_article(url: str) -> dict | None:
 
 # ── 오탈자 판단 ───────────────────────────────────────────
 def is_typo_only(old_title: str, new_title: str, old_body: str, new_body: str) -> bool:
+    """제목 동일 + 변경 단어 비율 낮으면 오탈자로 판단"""
     if old_title != new_title:
         return False
     old_w = set(old_body.split())
     new_w = set(new_body.split())
     changed = len(old_w.symmetric_difference(new_w))
     total = max(len(old_w | new_w), 1)
-    return (changed / total) < TYPO_THRESHOLD
+    ratio = changed / total
+    if ratio < TYPO_THRESHOLD:
+        log.info(f"오탈자 수준 변경 (변경률 {ratio:.1%}) → 무시")
+        return True
+    return False
 
 
 # ── 삭제 감지 ─────────────────────────────────────────────
@@ -266,7 +293,7 @@ async def send_modified(old: dict, new: dict, url: str, press: str, version: int
     if old["body"] != new["body"]:
         changes.append("📝 본문 변경됨")
     if img_changed:
-        changes.append("🖼️ 사진 변경됨 (실제 이미지 교체 확인)")
+        changes.append("🖼️ 사진 변경됨")
 
     msg = (
         f"🔴 기사 수정 감지! (v{version})\n\n"
@@ -277,7 +304,7 @@ async def send_modified(old: dict, new: dict, url: str, press: str, version: int
         "\n\n👉 웹 뷰어에서 전체 비교 확인 가능"
     )
     await send_telegram(msg)
-    log.info(f"수정 알림 발송: {url}")
+    log.info(f"수정 알림: {url}")
 
 
 async def handle_deleted(url: str):
@@ -299,7 +326,7 @@ async def handle_deleted(url: str):
         f"👉 웹 뷰어에서 삭제 전 마지막 내용 확인 가능"
     )
     await send_telegram(msg)
-    log.info(f"삭제 알림 발송: {url}")
+    log.info(f"삭제 알림: {url}")
 
 
 # ── 기사 처리 ─────────────────────────────────────────────
@@ -314,30 +341,18 @@ async def process_article(url: str):
 
     rows = await supa_get("articles", {"url": f"eq.{url}", "select": "*"})
     if not rows:
+        # 최초 수집: pHash 계산 후 저장
+        phash_str = await get_image_phash_str(parsed["images"])
         record = await supa_post("articles", {"url": url, "current_version": 0})
-    else:
-        record = rows[0]
-    if not record:
-        return
-
-    article_id = record["id"]
-    if record.get("is_deleted"):
-        return
-
-    versions = await supa_get("article_versions", {
-        "article_id": f"eq.{article_id}",
-        "select": "*",
-        "order": "version.desc",
-        "limit": "1",
-    })
-    latest = versions[0] if versions else None
-
-    if not latest:
+        if not record:
+            return
+        article_id = record["id"]
         await supa_post("article_versions", {
             "article_id": article_id, "version": 1,
             "title": parsed["title"], "body": parsed["body"],
             "images": parsed["images"], "press": parsed["press"],
             "hash": parsed["hash"], "fetched_at": parsed["fetched_at"],
+            "image_phash": phash_str,
         })
         await supa_patch("articles", {"id": article_id}, {
             "current_version": 1,
@@ -347,30 +362,69 @@ async def process_article(url: str):
         log.info(f"신규 저장: {parsed['title'][:40]}")
         return
 
+    record = rows[0]
+    if record.get("is_deleted"):
+        return
+
+    article_id = record["id"]
+    versions = await supa_get("article_versions", {
+        "article_id": f"eq.{article_id}",
+        "select": "*",
+        "order": "version.desc",
+        "limit": "1",
+    })
+    latest = versions[0] if versions else None
+
+    if not latest:
+        phash_str = await get_image_phash_str(parsed["images"])
+        await supa_post("article_versions", {
+            "article_id": article_id, "version": 1,
+            "title": parsed["title"], "body": parsed["body"],
+            "images": parsed["images"], "press": parsed["press"],
+            "hash": parsed["hash"], "fetched_at": parsed["fetched_at"],
+            "image_phash": phash_str,
+        })
+        await supa_patch("articles", {"id": article_id}, {
+            "current_version": 1,
+            "title": parsed["title"],
+            "press": parsed["press"],
+        })
+        log.info(f"신규 저장(기존 article): {parsed['title'][:40]}")
+        return
+
+    # 텍스트 변경 확인
     text_changed = latest["hash"] != parsed["hash"]
+
+    # 이미지 변경 확인 (pHash)
+    new_phash_str = await get_image_phash_str(parsed["images"])
     img_changed = await images_really_changed(
         latest.get("images") or [],
-        parsed.get("images") or []
+        parsed.get("images") or [],
+        latest.get("image_phash") or "",
+        new_phash_str,
     )
 
+    # 아무것도 안 바뀌면 완전 무시
     if not text_changed and not img_changed:
         return
 
+    # 오탈자 수준이면 저장도 알림도 안 함
+    if text_changed and not img_changed:
+        if is_typo_only(latest["title"], parsed["title"], latest["body"], parsed["body"]):
+            return
+
+    # 새 버전 저장
     new_v = latest["version"] + 1
     await supa_post("article_versions", {
         "article_id": article_id, "version": new_v,
         "title": parsed["title"], "body": parsed["body"],
         "images": parsed["images"], "press": parsed["press"],
         "hash": parsed["hash"], "fetched_at": parsed["fetched_at"],
+        "image_phash": new_phash_str,
     })
     await supa_patch("articles", {"id": article_id}, {
         "current_version": new_v, "title": parsed["title"],
     })
-
-    if text_changed and not img_changed:
-        if is_typo_only(latest["title"], parsed["title"], latest["body"], parsed["body"]):
-            log.info(f"오탈자 수준 (알림 생략): {parsed['title'][:40]}")
-            return
 
     log.info(f"변경 감지: {parsed['title'][:40]} | 텍스트={text_changed} 이미지={img_changed}")
     await send_modified(latest, parsed, url, parsed["press"], new_v, img_changed)
@@ -389,7 +443,7 @@ async def health_server():
 
 # ── 메인 ──────────────────────────────────────────────────
 async def main():
-    log.info(f"추적기 시작 (pHash 활성화) — 주기: {CRAWL_INTERVAL_SEC}초")
+    log.info(f"추적기 시작 (pHash DB저장 활성화) — 주기: {CRAWL_INTERVAL_SEC}초")
     await health_server()
     while True:
         start = time.monotonic()
