@@ -1,9 +1,10 @@
 """
-네이버 뉴스 추적기 - 완성본
-- 2분마다 네이버 뉴스 수집
-- 기사 수정 감지 → 텔레그램 알림
+네이버 뉴스 추적기 - 완성본 v3
+개선사항:
+- 이미지 URL을 해시에서 제외 → 사진 오탐 완전 차단
+- 단순 오탈자(변경량 5% 미만) 알림 생략, DB만 저장
 - 기사 삭제 감지 → 텔레그램 알림
-- Render 무료 웹서비스 호환 (aiohttp 헬스체크)
+- Render 무료 호환 헬스체크 서버
 """
 
 import asyncio
@@ -62,6 +63,9 @@ DELETED_KEYWORDS = [
     "이 기사는 언론사가 삭제했습니다",
     "요청하신 페이지를 찾을 수 없습니다",
 ]
+
+# 오탈자 필터: 변경된 단어 비율이 이 값 미만이면 알림 생략
+TYPO_THRESHOLD = 0.05  # 5%
 
 
 # ── Supabase REST API ─────────────────────────────────────
@@ -153,7 +157,9 @@ async def parse_article(url: str) -> dict | None:
             if not title and not body:
                 return None
 
+            # ★ 이미지 URL은 해시에서 제외 → 사진 URL 재발급으로 인한 오탐 차단
             h = hashlib.sha256((title + body).encode()).hexdigest()
+
             return {
                 "url": url, "title": title, "body": body,
                 "images": images, "press": press, "hash": h,
@@ -162,6 +168,20 @@ async def parse_article(url: str) -> dict | None:
         except Exception as ex:
             log.warning(f"파싱 오류 {url}: {ex}")
             return None
+
+
+# ── 오탈자 여부 판단 ──────────────────────────────────────
+def is_typo_only(old_title: str, new_title: str, old_body: str, new_body: str) -> bool:
+    """변경량이 전체 단어 대비 TYPO_THRESHOLD 미만이면 단순 오탈자로 판단."""
+    # 제목이 바뀌었으면 무조건 알림
+    if old_title != new_title:
+        return False
+
+    old_words = set(old_body.split())
+    new_words = set(new_body.split())
+    changed = len(old_words.symmetric_difference(new_words))
+    total = max(len(old_words | new_words), 1)
+    return (changed / total) < TYPO_THRESHOLD
 
 
 # ── 삭제 여부 확인 ────────────────────────────────────────
@@ -191,8 +211,6 @@ async def send_telegram_modified(old: dict, new: dict, url: str, press: str, ver
         changes.append(f"📌 제목 변경\n  이전: {old['title']}\n  이후: {new['title']}")
     if old["body"] != new["body"]:
         changes.append("📝 본문 변경됨")
-    if old.get("images") != new.get("images"):
-        changes.append("🖼️ 사진 변경됨")
 
     msg = (
         f"🔴 기사 수정 감지! (v{version})\n\n"
@@ -279,6 +297,7 @@ async def process_article(url: str):
     })
     latest = versions[0] if versions else None
 
+    # 최초 수집
     if not latest:
         await supa_post("article_versions", {
             "article_id": article_id, "version": 1,
@@ -294,10 +313,11 @@ async def process_article(url: str):
         log.info(f"신규 저장: {parsed['title'][:40]}")
         return
 
+    # 변경 없으면 종료
     if latest["hash"] == parsed["hash"]:
         return
 
-    log.info(f"변경 감지: {parsed['title'][:40]}")
+    # 새 버전 항상 저장 (오탈자 포함)
     new_v = latest["version"] + 1
     await supa_post("article_versions", {
         "article_id": article_id, "version": new_v,
@@ -308,6 +328,13 @@ async def process_article(url: str):
     await supa_patch("articles", {"id": article_id}, {
         "current_version": new_v, "title": parsed["title"],
     })
+
+    # ★ 오탈자 수준이면 DB만 저장, 텔레그램 알림 생략
+    if is_typo_only(latest["title"], parsed["title"], latest["body"], parsed["body"]):
+        log.info(f"오탈자 수준 변경 (알림 생략): {parsed['title'][:40]}")
+        return
+
+    log.info(f"변경 감지 (알림 발송): {parsed['title'][:40]}")
     await send_telegram_modified(latest, parsed, url, parsed["press"], new_v)
 
 
