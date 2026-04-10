@@ -1,14 +1,17 @@
 """
-네이버 뉴스 추적기 - 완성본 v3
-개선사항:
-- 이미지 URL을 해시에서 제외 → 사진 오탐 완전 차단
-- 단순 오탈자(변경량 5% 미만) 알림 생략, DB만 저장
+네이버 뉴스 추적기 - 완성본 v4
+핵심 개선:
+- 퍼셉추얼 해시(pHash)로 이미지 내용 자체를 비교
+  → URL·파일명이 달라도 같은 사진이면 "변경 없음"
+  → 진짜 다른 사진으로 교체된 경우만 "사진 변경" 감지
+- 이미지는 해시에서 제외, 별도 pHash로만 비교
+- 단순 오탈자(변경량 5% 미만) 알림 생략
 - 기사 삭제 감지 → 텔레그램 알림
-- Render 무료 호환 헬스체크 서버
 """
 
 import asyncio
 import hashlib
+import io
 import os
 import time
 import logging
@@ -18,6 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 import feedparser
 from aiohttp import web
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -64,8 +68,71 @@ DELETED_KEYWORDS = [
     "요청하신 페이지를 찾을 수 없습니다",
 ]
 
-# 오탈자 필터: 변경된 단어 비율이 이 값 미만이면 알림 생략
-TYPO_THRESHOLD = 0.05  # 5%
+TYPO_THRESHOLD = 0.05  # 변경 단어 비율 5% 미만 → 오탈자로 판단
+PHASH_THRESHOLD = 10   # pHash 해밍 거리 10 이하 → 같은 이미지로 판단
+
+
+# ── 퍼셉추얼 해시 (pHash) ─────────────────────────────────
+def compute_phash(img_bytes: bytes) -> int | None:
+    """
+    이미지 바이트를 받아 64비트 pHash 정수를 반환.
+    같은 사진 = 해밍 거리 0~5, 다른 사진 = 해밍 거리 20 이상이 일반적.
+    """
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("L").resize((8, 8), Image.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = "".join("1" if p >= avg else "0" for p in pixels)
+        return int(bits, 2)
+    except Exception:
+        return None
+
+
+def hamming_distance(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+async def fetch_phash(url: str) -> int | None:
+    """이미지 URL을 다운로드해서 pHash 계산."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(url, headers=HEADERS, follow_redirects=True)
+            if r.status_code == 200:
+                return compute_phash(r.content)
+    except Exception:
+        pass
+    return None
+
+
+async def images_really_changed(old_urls: list[str], new_urls: list[str]) -> bool:
+    """
+    pHash로 두 이미지 목록이 실제로 다른지 비교.
+    - 개수가 달라지면 → 변경
+    - 같은 자리 이미지 pHash 해밍 거리 > PHASH_THRESHOLD → 변경
+    - 그 외 → 동일
+    """
+    old_ = old_urls or []
+    new_ = new_urls or []
+
+    # 개수 자체가 달라지면 변경
+    if len(old_) != len(new_):
+        return True
+
+    # 이미지가 없으면 변경 아님
+    if not old_:
+        return False
+
+    # 대표 이미지(첫 번째)만 비교 — 서버 부담 최소화
+    old_hash = await fetch_phash(old_[0])
+    new_hash = await fetch_phash(new_[0])
+
+    if old_hash is None or new_hash is None:
+        # 다운로드 실패 시 URL로 fallback 비교
+        return old_[0] != new_[0]
+
+    distance = hamming_distance(old_hash, new_hash)
+    log.debug(f"pHash 해밍 거리: {distance} (임계값: {PHASH_THRESHOLD})")
+    return distance > PHASH_THRESHOLD
 
 
 # ── Supabase REST API ─────────────────────────────────────
@@ -91,7 +158,7 @@ async def supa_patch(table: str, match: dict, data: dict):
         await c.patch(url, params=params, json=data)
 
 
-# ── RSS + 홈페이지에서 URL 수집 ───────────────────────────
+# ── RSS + 홈 수집 ─────────────────────────────────────────
 async def fetch_urls() -> list[str]:
     urls: set[str] = set()
     async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as c:
@@ -105,7 +172,6 @@ async def fetch_urls() -> list[str]:
                         urls.add(link)
             except Exception as ex:
                 log.warning(f"RSS 오류: {ex}")
-
         try:
             r = await c.get("https://news.naver.com/")
             soup = BeautifulSoup(r.text, "lxml")
@@ -115,7 +181,6 @@ async def fetch_urls() -> list[str]:
                 urls.add(a["href"])
         except Exception as ex:
             log.warning(f"홈 수집 오류: {ex}")
-
     log.info(f"수집 URL: {len(urls)}개")
     return list(urls)
 
@@ -157,7 +222,7 @@ async def parse_article(url: str) -> dict | None:
             if not title and not body:
                 return None
 
-            # ★ 이미지 URL은 해시에서 제외 → 사진 URL 재발급으로 인한 오탐 차단
+            # 이미지 URL은 해시에서 제외 (pHash로 별도 비교)
             h = hashlib.sha256((title + body).encode()).hexdigest()
 
             return {
@@ -170,21 +235,18 @@ async def parse_article(url: str) -> dict | None:
             return None
 
 
-# ── 오탈자 여부 판단 ──────────────────────────────────────
+# ── 오탈자 판단 ───────────────────────────────────────────
 def is_typo_only(old_title: str, new_title: str, old_body: str, new_body: str) -> bool:
-    """변경량이 전체 단어 대비 TYPO_THRESHOLD 미만이면 단순 오탈자로 판단."""
-    # 제목이 바뀌었으면 무조건 알림
     if old_title != new_title:
         return False
-
-    old_words = set(old_body.split())
-    new_words = set(new_body.split())
-    changed = len(old_words.symmetric_difference(new_words))
-    total = max(len(old_words | new_words), 1)
+    old_w = set(old_body.split())
+    new_w = set(new_body.split())
+    changed = len(old_w.symmetric_difference(new_w))
+    total = max(len(old_w | new_w), 1)
     return (changed / total) < TYPO_THRESHOLD
 
 
-# ── 삭제 여부 확인 ────────────────────────────────────────
+# ── 삭제 감지 ─────────────────────────────────────────────
 async def check_deleted(url: str) -> bool:
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=False) as c:
         try:
@@ -204,13 +266,18 @@ async def check_deleted(url: str) -> bool:
     return False
 
 
-# ── 텔레그램: 기사 수정 알림 ─────────────────────────────
-async def send_telegram_modified(old: dict, new: dict, url: str, press: str, version: int):
+# ── 텔레그램 알림 ─────────────────────────────────────────
+async def send_telegram_modified(
+    old: dict, new: dict, url: str, press: str, version: int,
+    img_changed: bool
+):
     changes = []
     if old["title"] != new["title"]:
         changes.append(f"📌 제목 변경\n  이전: {old['title']}\n  이후: {new['title']}")
     if old["body"] != new["body"]:
         changes.append("📝 본문 변경됨")
+    if img_changed:
+        changes.append("🖼️ 사진 변경됨 (실제 이미지 교체 확인)")
 
     msg = (
         f"🔴 기사 수정 감지! (v{version})\n\n"
@@ -228,7 +295,6 @@ async def send_telegram_modified(old: dict, new: dict, url: str, press: str, ver
     log.info(f"텔레그램 수정 알림: {url}")
 
 
-# ── 텔레그램: 기사 삭제 알림 ─────────────────────────────
 async def send_telegram_deleted(record: dict, url: str):
     msg = (
         f"🚨 기사 삭제 감지!\n\n"
@@ -247,7 +313,7 @@ async def send_telegram_deleted(record: dict, url: str):
     log.info(f"텔레그램 삭제 알림: {url}")
 
 
-# ── 삭제된 기사 DB 처리 ───────────────────────────────────
+# ── 삭제 처리 ─────────────────────────────────────────────
 async def handle_deleted_article(url: str):
     rows = await supa_get("articles", {"url": f"eq.{url}", "select": "*"})
     if not rows:
@@ -255,23 +321,21 @@ async def handle_deleted_article(url: str):
     record = rows[0]
     if record.get("is_deleted"):
         return
-    article_id = record["id"]
-    log.info(f"기사 삭제 처리: {record.get('title', url)[:40]}")
-    await supa_patch("articles", {"id": article_id}, {
+    await supa_patch("articles", {"id": record["id"]}, {
         "is_deleted": True,
         "deleted_at": datetime.now(KST).isoformat(),
     })
     await send_telegram_deleted(record, url)
 
 
-# ── 기사 1개 처리 파이프라인 ─────────────────────────────
+# ── 기사 처리 파이프라인 ──────────────────────────────────
 async def process_article(url: str):
-    # 1. 삭제 여부 먼저 확인
+    # 1. 삭제 확인
     if await check_deleted(url):
         await handle_deleted_article(url)
         return
 
-    # 2. 정상 기사 파싱
+    # 2. 파싱
     parsed = await parse_article(url)
     if not parsed:
         return
@@ -285,7 +349,6 @@ async def process_article(url: str):
         return
 
     article_id = record["id"]
-
     if record.get("is_deleted"):
         return
 
@@ -313,11 +376,19 @@ async def process_article(url: str):
         log.info(f"신규 저장: {parsed['title'][:40]}")
         return
 
-    # 변경 없으면 종료
-    if latest["hash"] == parsed["hash"]:
+    # 텍스트 변경 여부 (제목+본문 해시)
+    text_changed = latest["hash"] != parsed["hash"]
+
+    # 이미지 변경 여부 (pHash로 실제 비교)
+    old_imgs = latest.get("images") or []
+    new_imgs = parsed.get("images") or []
+    img_changed = await images_really_changed(old_imgs, new_imgs)
+
+    # 아무것도 안 바뀌면 종료
+    if not text_changed and not img_changed:
         return
 
-    # 새 버전 항상 저장 (오탈자 포함)
+    # 새 버전 저장
     new_v = latest["version"] + 1
     await supa_post("article_versions", {
         "article_id": article_id, "version": new_v,
@@ -329,13 +400,14 @@ async def process_article(url: str):
         "current_version": new_v, "title": parsed["title"],
     })
 
-    # ★ 오탈자 수준이면 DB만 저장, 텔레그램 알림 생략
-    if is_typo_only(latest["title"], parsed["title"], latest["body"], parsed["body"]):
-        log.info(f"오탈자 수준 변경 (알림 생략): {parsed['title'][:40]}")
-        return
+    # 오탈자 수준이면 알림 생략
+    if text_changed and not img_changed:
+        if is_typo_only(latest["title"], parsed["title"], latest["body"], parsed["body"]):
+            log.info(f"오탈자 수준 (알림 생략): {parsed['title'][:40]}")
+            return
 
-    log.info(f"변경 감지 (알림 발송): {parsed['title'][:40]}")
-    await send_telegram_modified(latest, parsed, url, parsed["press"], new_v)
+    log.info(f"변경 감지 (알림): {parsed['title'][:40]} | 텍스트={text_changed} 이미지={img_changed}")
+    await send_telegram_modified(latest, parsed, url, parsed["press"], new_v, img_changed)
 
 
 # ── 헬스체크 서버 ─────────────────────────────────────────
