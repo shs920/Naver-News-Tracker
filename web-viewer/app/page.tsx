@@ -29,56 +29,34 @@ interface Version {
   fetched_at: string;
 }
 
-// ── pHash 해밍 거리 계산 ──────────────────────────────────
+// ── pHash 해밍 거리 ───────────────────────────────────────
 function hammingDistance(a: string, b: string): number {
   try {
     const na = BigInt(a), nb = BigInt(b);
     return (na ^ nb).toString(2).split("").filter(c => c === "1").length;
   } catch { return 999; }
 }
-
 const PHASH_THRESHOLD = 10;
 
-// ── 이미지 비교 (pHash 우선) ──────────────────────────────
+// ── 이미지 비교 ───────────────────────────────────────────
 function compareImages(
   oldImgs: string[], newImgs: string[],
   oldPhash: string | null, newPhash: string | null
 ) {
   const old_ = oldImgs || [], new_ = newImgs || [];
-
-  // 개수 다르면 변경
   if (old_.length !== new_.length) {
-    const removed = old_.filter(u => !new_.includes(u));
-    const added   = new_.filter(u => !old_.includes(u));
-    return { changed: true, sameByPhash: false, removed, added, uncertain: [] };
+    return { changed: true, removed: old_, added: new_, uncertain: [] };
   }
-
-  if (old_.length === 0) {
-    return { changed: false, sameByPhash: true, removed: [], added: [], uncertain: [] };
-  }
-
-  // pHash로 비교
+  if (old_.length === 0) return { changed: false, removed: [], added: [], uncertain: [] };
   if (oldPhash && newPhash) {
     const dist = hammingDistance(oldPhash, newPhash);
-    if (dist <= PHASH_THRESHOLD) {
-      // 같은 이미지 → 변경 없음
-      return { changed: false, sameByPhash: true, removed: [], added: [], uncertain: [] };
-    } else {
-      // 다른 이미지 → 변경
-      return {
-        changed: true, sameByPhash: false,
-        removed: old_, added: new_, uncertain: []
-      };
-    }
+    if (dist <= PHASH_THRESHOLD) return { changed: false, removed: [], added: [], uncertain: [] };
+    return { changed: true, removed: old_, added: new_, uncertain: [] };
   }
-
-  // pHash 없으면 URL 비교
   const same = old_.every((u, i) => u === new_[i]);
-  if (same) return { changed: false, sameByPhash: false, removed: [], added: [], uncertain: [] };
-
+  if (same) return { changed: false, removed: [], added: [], uncertain: [] };
   return {
-    changed: true, sameByPhash: false,
-    removed: [], added: [],
+    changed: true, removed: [], added: [],
     uncertain: old_.map((ou, i) => ({ oldUrl: ou, newUrl: new_[i] })).filter((_, i) => old_[i] !== new_[i])
   };
 }
@@ -88,28 +66,19 @@ function inlineDiff(oldText: string, newText: string) {
   const tokenize = (t: string) => (t || "").split(/(\s+)/);
   const oldW = tokenize(oldText), newW = tokenize(newText);
   const m = oldW.length, n = newW.length;
-  const dp: number[][] = Array.from({ length: m+1 }, () => new Array(n+1).fill(0));
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
       dp[i][j] = oldW[i-1] === newW[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
-
   type Op = { type: "same"|"del"|"add"; text: string };
   const ops: Op[] = [];
   let i = m, j = n;
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldW[i-1] === newW[j-1]) {
-      ops.unshift({ type: "same", text: oldW[i-1] }); i--; j--;
-    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
-      ops.unshift({ type: "add", text: newW[j-1] }); j--;
-    } else {
-      ops.unshift({ type: "del", text: oldW[i-1] }); i--;
-    }
+    if (i > 0 && j > 0 && oldW[i-1] === newW[j-1]) { ops.unshift({ type: "same", text: oldW[i-1] }); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { ops.unshift({ type: "add", text: newW[j-1] }); j--; }
+    else { ops.unshift({ type: "del", text: oldW[i-1] }); i--; }
   }
-
-  const HL: React.CSSProperties = {
-    background: "#ffd6d6", color: "#7a0000",
-    fontWeight: 700, borderRadius: 2, padding: "0 1px",
-  };
+  const HL: React.CSSProperties = { background: "#ffd6d6", color: "#7a0000", fontWeight: 700, borderRadius: 2, padding: "0 1px" };
   const oldNodes = ops.map((op, idx) =>
     op.type === "same" ? <span key={idx}>{op.text}</span>
     : op.type === "del" ? <mark key={idx} style={HL}>{op.text}</mark>
@@ -134,17 +103,12 @@ function paragraphDiff(oldText: string, newText: string): ParaDiff[] {
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
       dp[i][j] = oldP[i-1] === newP[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
-
   const raw: ParaDiff[] = [];
   let i = m, j = n;
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldP[i-1] === newP[j-1]) {
-      raw.unshift({ type: "same", old: oldP[i-1], new: newP[j-1] }); i--; j--;
-    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
-      raw.unshift({ type: "add", new: newP[j-1] }); j--;
-    } else {
-      raw.unshift({ type: "del", old: oldP[i-1] }); i--;
-    }
+    if (i > 0 && j > 0 && oldP[i-1] === newP[j-1]) { raw.unshift({ type: "same", old: oldP[i-1], new: oldP[i-1] }); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { raw.unshift({ type: "add", new: newP[j-1] }); j--; }
+    else { raw.unshift({ type: "del", old: oldP[i-1] }); i--; }
   }
   const merged: ParaDiff[] = [];
   for (let k = 0; k < raw.length; k++) {
@@ -164,11 +128,12 @@ function BodyDiff({ oldText, newText, vA, vB }: {
   const C: React.CSSProperties = { fontSize: 13, lineHeight: 1.8, margin: "0 0 8px", background: "#fff0f0", borderRadius: 4, padding: "3px 7px", borderLeft: "3px solid #e53935" };
   const D: React.CSSProperties = { ...C, background: "#ffd6d6" };
   const E: React.CSSProperties = { margin: "0 0 8px", minHeight: 24 };
-
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
       <div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>수정 전 (v{vA})</div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>
+          수정 전 (v{vA})
+        </div>
         {diff.map((d, idx) => {
           if (d.type === "same") return <p key={idx} style={N}>{d.old}</p>;
           if (d.type === "del")  return <p key={idx} style={D}><strong style={{ color: "#7a0000" }}>{d.old}</strong></p>;
@@ -178,7 +143,9 @@ function BodyDiff({ oldText, newText, vA, vB }: {
         })}
       </div>
       <div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>수정 후 (v{vB})</div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#c0392b", marginBottom: 10, paddingBottom: 6, borderBottom: "2px solid #f5c6c6" }}>
+          수정 후 (v{vB})
+        </div>
         {diff.map((d, idx) => {
           if (d.type === "same") return <p key={idx} style={N}>{d.new}</p>;
           if (d.type === "del")  return <div key={idx} style={E} />;
@@ -238,7 +205,9 @@ function DeletedView({ article, versions }: { article: Article; versions: Versio
         <section>
           <h3 style={{ fontSize: 14, margin: "0 0 8px" }}>🖼️ 삭제 전 마지막 사진</h3>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))", gap: 12 }}>
-            {last.images.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "1px solid #ddd" }} />)}
+            {last.images.map((img, i) => (
+              <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "1px solid #ddd" }} />
+            ))}
           </div>
         </section>
       )}
@@ -247,8 +216,12 @@ function DeletedView({ article, versions }: { article: Article; versions: Versio
 }
 
 // ── 메인 ─────────────────────────────────────────────────
+const PAGE_SIZE = 50;
+
 export default function NewsTracker() {
   const [articles, setArticles] = useState<Article[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<Article | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [vA, setVersionA] = useState(0);
@@ -256,18 +229,39 @@ export default function NewsTracker() {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState<"modified"|"deleted">("modified");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const fetchArticles = useCallback(async () => {
-    const { data } = await supabase.from("articles").select("*")
-      .order("updated_at", { ascending: false }).limit(200);
+  const fetchCount = useCallback(async (t: string, s: string) => {
+    let q = supabase.from("articles").select("id", { count: "exact", head: true });
+    if (t === "modified") q = q.eq("is_deleted", false).gt("current_version", 1);
+    else q = q.eq("is_deleted", true);
+    if (s) q = q.or(`title.ilike.%${s}%,press.ilike.%${s}%`);
+    const { count } = await q;
+    setTotalCount(count || 0);
+  }, []);
+
+  const fetchArticles = useCallback(async (t: string, s: string, p: number) => {
+    let q = supabase.from("articles").select("*");
+    if (t === "modified") q = q.eq("is_deleted", false).gt("current_version", 1);
+    else q = q.eq("is_deleted", true);
+    if (s) q = q.or(`title.ilike.%${s}%,press.ilike.%${s}%`);
+    q = q.order("updated_at", { ascending: false }).range(p * PAGE_SIZE, (p + 1) * PAGE_SIZE - 1);
+    const { data } = await q;
     if (data) setArticles(data);
   }, []);
 
   useEffect(() => {
-    fetchArticles();
-    const t = setInterval(fetchArticles, 60000);
+    fetchCount(tab, search);
+    fetchArticles(tab, search, page);
+  }, [tab, search, page, fetchCount, fetchArticles]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      fetchCount(tab, search);
+      fetchArticles(tab, search, page);
+    }, 60000);
     return () => clearInterval(t);
-  }, [fetchArticles]);
+  }, [tab, search, page, fetchCount, fetchArticles]);
 
   const selectArticle = async (a: Article) => {
     setSelected(a); setLoading(true);
@@ -281,59 +275,69 @@ export default function NewsTracker() {
     setLoading(false);
   };
 
+  // 완전 삭제 (DB에서 제거)
+  const deleteArticle = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm("이 기사를 완전히 삭제하시겠습니까?\n(복구할 수 없습니다)")) return;
+    setDeletingId(id);
+    await supabase.from("article_versions").delete().eq("article_id", id);
+    await supabase.from("articles").delete().eq("id", id);
+    setDeletingId(null);
+    setArticles(prev => prev.filter(a => a.id !== id));
+    setTotalCount(prev => Math.max(0, prev - 1));
+    if (selected?.id === id) setSelected(null);
+  };
+
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
   const verA = versions.find(v => v.version === vA);
   const verB = versions.find(v => v.version === vB);
-
-  // 실제로 의미 있는 변경이 있는 기사만 표시
-  const modifiedList = articles.filter(a =>
-    !a.is_deleted && a.current_version > 1 &&
-    (a.title?.includes(search) || a.press?.includes(search))
-  );
-  const deletedList = articles.filter(a =>
-    a.is_deleted && (a.title?.includes(search) || a.press?.includes(search))
-  );
-  const activeList = tab === "modified" ? modifiedList : deletedList;
-
   const imgDiff = verA && verB
     ? compareImages(verA.images || [], verB.images || [], verA.image_phash || null, verB.image_phash || null)
     : null;
   const titleChanged = verA && verB && verA.title !== verB.title;
   const bodyChanged  = verA && verB && verA.body  !== verB.body;
 
+  const handleTabChange = (newTab: "modified"|"deleted") => {
+    setTab(newTab); setSelected(null); setPage(0);
+  };
+  const handleSearch = (v: string) => { setSearch(v); setPage(0); };
+
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, sans-serif", fontSize: 14 }}>
 
-      {/* 왼쪽 목록 */}
+      {/* ── 왼쪽 목록 ── */}
       <div style={{ width: 300, borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column", background: "#f9f9f9", flexShrink: 0 }}>
         <div style={{ padding: "14px 12px 8px", borderBottom: "1px solid #e0e0e0" }}>
           <h2 style={{ margin: "0 0 10px", fontSize: 15 }}>📡 네이버 뉴스 추적기</h2>
           <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-            <button onClick={() => { setTab("modified"); setSelected(null); }}
+            <button onClick={() => handleTabChange("modified")}
               style={{ flex: 1, padding: "6px 0", borderRadius: 6, border: "1px solid #ccc", fontSize: 12, fontWeight: 600, cursor: "pointer",
                 background: tab === "modified" ? "#1a73e8" : "#fff", color: tab === "modified" ? "#fff" : "#333" }}>
-              ✏️ 수정 ({modifiedList.length})
+              ✏️ 수정 ({tab === "modified" ? totalCount : ""})
             </button>
-            <button onClick={() => { setTab("deleted"); setSelected(null); }}
+            <button onClick={() => handleTabChange("deleted")}
               style={{ flex: 1, padding: "6px 0", borderRadius: 6, border: "1px solid #ccc", fontSize: 12, fontWeight: 600, cursor: "pointer",
                 background: tab === "deleted" ? "#e53935" : "#fff", color: tab === "deleted" ? "#fff" : "#333" }}>
-              🚨 삭제 ({deletedList.length})
+              🚨 삭제 ({tab === "deleted" ? totalCount : ""})
             </button>
           </div>
-          <input placeholder="제목·언론사 검색" value={search} onChange={e => setSearch(e.target.value)}
+          <input placeholder="제목·언론사 검색" value={search} onChange={e => handleSearch(e.target.value)}
             style={{ width: "100%", padding: "6px 8px", border: "1px solid #ccc", borderRadius: 6, fontSize: 13, boxSizing: "border-box" }} />
         </div>
+
         <div style={{ flex: 1, overflowY: "auto" }}>
-          {activeList.length === 0 && (
-            <p style={{ color: "#999", textAlign: "center", marginTop: 40, fontSize: 13 }}>
-              {tab === "modified" ? "수정된 기사가 없습니다" : "삭제된 기사가 없습니다"}
-            </p>
+          {articles.length === 0 && (
+            <p style={{ color: "#999", textAlign: "center", marginTop: 40, fontSize: 13 }}>기사가 없습니다</p>
           )}
-          {activeList.map(a => (
-            <div key={a.id} onClick={() => selectArticle(a)}
-              style={{ padding: "10px 12px", borderBottom: "1px solid #eee", cursor: "pointer",
+          {articles.map(a => (
+            <div key={a.id}
+              onClick={() => selectArticle(a)}
+              style={{ padding: "10px 12px 10px 12px", borderBottom: "1px solid #eee", cursor: "pointer", position: "relative",
                 background: selected?.id === a.id ? (a.is_deleted ? "#ffebee" : "#e8f0fe") : "transparent" }}>
-              <div style={{ display: "flex", alignItems: "flex-start", gap: 4, marginBottom: 3 }}>
-                {a.is_deleted && <span style={{ fontSize: 10, background: "#e53935", color: "#fff", borderRadius: 4, padding: "1px 5px", flexShrink: 0, marginTop: 2 }}>삭제</span>}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 4, marginBottom: 3, paddingRight: 24 }}>
+                {a.is_deleted && (
+                  <span style={{ fontSize: 10, background: "#e53935", color: "#fff", borderRadius: 4, padding: "1px 5px", flexShrink: 0, marginTop: 2 }}>삭제</span>
+                )}
                 <div style={{ fontWeight: 600, lineHeight: 1.4, fontSize: 13 }}>{a.title || "제목 없음"}</div>
               </div>
               <div style={{ color: "#666", fontSize: 11 }}>
@@ -341,22 +345,52 @@ export default function NewsTracker() {
                   ? `삭제: ${a.deleted_at ? new Date(a.deleted_at).toLocaleString("ko-KR") : "알 수 없음"}`
                   : `v${a.current_version}회 수정 · ${new Date(a.updated_at).toLocaleString("ko-KR")}`}
               </div>
+              {/* 완전 삭제 버튼 */}
+              <button
+                onClick={e => deleteArticle(a.id, e)}
+                title="완전 삭제"
+                disabled={deletingId === a.id}
+                style={{
+                  position: "absolute", top: 8, right: 8,
+                  background: "none", border: "none", cursor: "pointer",
+                  fontSize: 14, color: "#bbb", padding: 2, lineHeight: 1,
+                  opacity: deletingId === a.id ? 0.3 : 1,
+                }}>
+                ✕
+              </button>
             </div>
           ))}
         </div>
+
+        {/* 페이지네이션 */}
+        {totalPages > 1 && (
+          <div style={{ padding: "8px 12px", borderTop: "1px solid #e0e0e0", display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: "#666" }}>
+            <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
+              style={{ padding: "4px 10px", borderRadius: 5, border: "1px solid #ccc", cursor: page === 0 ? "not-allowed" : "pointer", background: "#fff", fontSize: 12 }}>
+              ◀ 이전
+            </button>
+            <span>{page + 1} / {totalPages} 페이지</span>
+            <button onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1}
+              style={{ padding: "4px 10px", borderRadius: 5, border: "1px solid #ccc", cursor: page >= totalPages - 1 ? "not-allowed" : "pointer", background: "#fff", fontSize: 12 }}>
+              다음 ▶
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* 오른쪽 비교 뷰 */}
+      {/* ── 오른쪽 비교 뷰 ── */}
       <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
         {!selected && (
           <div style={{ textAlign: "center", color: "#999", marginTop: 100 }}>
             <div style={{ fontSize: 40 }}>{tab === "deleted" ? "🚨" : "📰"}</div>
             <p>왼쪽에서 기사를 선택하면 내용이 표시됩니다</p>
+            <p style={{ fontSize: 12, color: "#bbb" }}>기사 오른쪽 ✕ 버튼으로 영구 삭제할 수 있습니다</p>
           </div>
         )}
 
         {selected && loading && <p style={{ color: "#999" }}>로딩 중...</p>}
 
+        {/* 삭제된 기사 뷰 */}
         {selected && !loading && selected.is_deleted && (
           <>
             <div style={{ marginBottom: 16 }}>
@@ -367,6 +401,7 @@ export default function NewsTracker() {
           </>
         )}
 
+        {/* 수정된 기사 비교 뷰 */}
         {selected && !loading && !selected.is_deleted && (
           <>
             <div style={{ marginBottom: 16 }}>
@@ -374,22 +409,27 @@ export default function NewsTracker() {
               <a href={selected.url} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", fontSize: 12 }}>{selected.url}</a>
             </div>
 
+            {/* 버전 선택 */}
             <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 24, background: "#f0f4ff", padding: "10px 14px", borderRadius: 8 }}>
               <span style={{ fontWeight: 700, fontSize: 13 }}>비교:</span>
               <select value={vA} onChange={e => setVersionA(Number(e.target.value))}
                 style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc", fontSize: 12 }}>
-                {versions.map(v => <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>)}
+                {versions.map(v => (
+                  <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>
+                ))}
               </select>
               <span>↔</span>
               <select value={vB} onChange={e => setVersionB(Number(e.target.value))}
                 style={{ padding: "4px 8px", borderRadius: 5, border: "1px solid #ccc", fontSize: 12 }}>
-                {versions.map(v => <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>)}
+                {versions.map(v => (
+                  <option key={v.id} value={v.version}>v{v.version} — {new Date(v.fetched_at).toLocaleString("ko-KR")}</option>
+                ))}
               </select>
             </div>
 
             {verA && verB && (
               <>
-                {/* 제목 */}
+                {/* 제목 비교 */}
                 {titleChanged && (
                   <section style={{ marginBottom: 28 }}>
                     <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>📌 제목 변경</h3>
@@ -397,7 +437,7 @@ export default function NewsTracker() {
                   </section>
                 )}
 
-                {/* 본문 */}
+                {/* 본문 비교 */}
                 <section style={{ marginBottom: 28 }}>
                   <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>📝 본문 비교</h3>
                   {!bodyChanged ? (
@@ -409,7 +449,7 @@ export default function NewsTracker() {
                   )}
                 </section>
 
-                {/* 사진 */}
+                {/* 사진 비교 */}
                 <section style={{ marginBottom: 28 }}>
                   <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>🖼️ 사진 비교</h3>
                   {!imgDiff?.changed ? (
@@ -437,11 +477,15 @@ export default function NewsTracker() {
                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                           <div>
                             <div style={{ fontSize: 11, color: "#c0392b", fontWeight: 700, marginBottom: 8 }}>수정 전 사진</div>
-                            {imgDiff.removed.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #f5c6c6", marginBottom: 8 }} />)}
+                            {imgDiff.removed.map((img, i) => (
+                              <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #f5c6c6", marginBottom: 8 }} />
+                            ))}
                           </div>
                           <div>
                             <div style={{ fontSize: 11, color: "#27ae60", fontWeight: 700, marginBottom: 8 }}>수정 후 사진</div>
-                            {imgDiff.added.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #b2dfdb", marginBottom: 8 }} />)}
+                            {imgDiff.added.map((img, i) => (
+                              <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, border: "2px solid #b2dfdb", marginBottom: 8 }} />
+                            ))}
                           </div>
                         </div>
                       )}
