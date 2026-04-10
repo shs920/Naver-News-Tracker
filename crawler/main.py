@@ -153,7 +153,7 @@ async def parse_article(url: str) -> dict | None:
             if not title and not body:
                 return None
 
-            h = hashlib.sha256((title + body + str(images)).encode()).hexdigest()
+            h = hashlib.sha256((title + body).encode()).hexdigest()
             return {
                 "url": url, "title": title, "body": body,
                 "images": images, "press": press, "hash": h,
